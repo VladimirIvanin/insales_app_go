@@ -286,6 +286,10 @@ func (s *DB) migrateV2() error {
 	return tx.Commit()
 }
 
+func closeRows(rows *sql.Rows, err error) error {
+	return errors.Join(err, rows.Close())
+}
+
 func (s *DB) migrateV3() error {
 	if _, err := s.db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
 		return err
@@ -367,8 +371,7 @@ func (s *DB) migrateV3() error {
 	for rows.Next() {
 		var c candRow
 		if err := rows.Scan(&c.id, &c.storeID, &c.shop, &c.password, &c.generation, &c.created); err != nil {
-			rows.Close()
-			return err
+			return closeRows(rows, err)
 		}
 		if kept[c.shop] >= MaxCandidatesPerShop {
 			continue
@@ -377,10 +380,11 @@ func (s *DB) migrateV3() error {
 		keep = append(keep, c)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		return closeRows(rows, err)
+	}
+	if err := closeRows(rows, nil); err != nil {
 		return err
 	}
-	rows.Close()
 	for _, c := range keep {
 		if _, err := tx.Exec(`
 			INSERT INTO candidates_v3 (id, store_id, shop, password, generation, created_at)
@@ -909,23 +913,22 @@ func (s *DB) Uninstall(storeID int, shop, password string) (bool, error) {
 		hadPending = true
 		var id, passEnc string
 		if err := rows.Scan(&id, &passEnc); err != nil {
-			rows.Close()
-			return false, err
+			return false, closeRows(rows, err)
 		}
 		plain, err := s.decrypt(passEnc)
 		if err != nil {
-			rows.Close()
-			return false, err
+			return false, closeRows(rows, err)
 		}
 		if passwordsEqual(password, plain) {
 			matched = append(matched, id)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		return false, closeRows(rows, err)
+	}
+	if err := closeRows(rows, nil); err != nil {
 		return false, err
 	}
-	rows.Close()
 
 	if !activeMatch && len(matched) == 0 {
 		if activeHere || hadPending {
