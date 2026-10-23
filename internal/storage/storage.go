@@ -1,12 +1,7 @@
 // Package storage provides SQLite-backed persistence for InSales app state.
 //
-// This implementation uses a single SQLite database for all state:
-//   - Stores (shop installations with credentials)
-//   - Sessions (authenticated browser sessions)
-//   - Challenges (one-time login nonces)
-//   - Candidates (pending installation verifications)
-//
-// First version: single process, single file. Not designed for horizontal scaling.
+// Один процесс и один файл. Подключение, кандидат установки, challenge и
+// сессия связаны общим номером поколения. Фоновой очереди нет.
 package storage
 
 import (
@@ -21,9 +16,14 @@ import (
 	"io"
 	"time"
 
-	"log/slog"
-
 	_ "modernc.org/sqlite"
+)
+
+const (
+	// MaxCandidatesPerShop — сколько непроверенных установок хранить на один домен.
+	MaxCandidatesPerShop = 5
+	// CandidateTTL — срок жизни непроверенного кандидата.
+	CandidateTTL = 7 * 24 * time.Hour
 )
 
 // Common errors.
@@ -31,50 +31,67 @@ var (
 	ErrNotFound      = errors.New("not found")
 	ErrAlreadyExists = errors.New("already exists")
 	ErrNotAuthorized = errors.New("not authorized")
+	ErrStale         = errors.New("stale generation")
 )
 
-// Store represents an installed shop.
+// Migration describes one schema version.
+type Migration struct {
+	Version int
+	Name    string
+}
+
+// Migrations is the ordered list of schema versions.
+var Migrations = []Migration{
+	{Version: 1, Name: "начальная схема"},
+	{Version: 2, Name: "installation_epoch"},
+	{Version: 3, Name: "проверка при входе и один счётчик поколений"},
+}
+
+// Store is a verified shop connection.
 type Store struct {
-	ID                int    // insales_id
-	Shop              string // canonical shop domain
-	Password          string // encrypted install password
-	Title             string // shop title from API
-	Generation        int64  // monotonic generation counter for credential rotation
-	InstallationEpoch int64  // monotonic epoch, never reset — prevents cross-installation session reuse
-	CreatedAt         time.Time
+	ID         int
+	Shop       string
+	Password   string
+	Title      string
+	Generation int64
+	CreatedAt  time.Time
 }
 
-// Session represents an authenticated browser session.
+// Session is an authenticated browser session bound to an installation generation.
 type Session struct {
-	ID                string
-	StoreID           int
-	UserID            string
-	Generation        int64
-	InstallationEpoch int64
-	ExpiresAt         time.Time
+	ID         string
+	StoreID    int
+	UserID     string
+	Generation int64
+	ExpiresAt  time.Time
 }
 
-// Challenge represents a one-time login nonce.
+// Challenge is a one-time login nonce bound to a browser and installation generation.
 type Challenge struct {
-	ID        string
-	StoreID   int
-	Nonce     string
-	BrowserID string
-	ExpiresAt time.Time
+	ID         string
+	StoreID    int
+	Nonce      string
+	BrowserID  string
+	Generation int64
+	ExpiresAt  time.Time
 }
 
-// Candidate represents a pending installation being verified.
+// Candidate is an install that has not been verified yet.
 type Candidate struct {
-	ID          string
-	StoreID     int // insales_id from install callback
-	Shop        string
-	Password    string // encrypted password
+	ID         string
+	StoreID    int
+	Shop       string
+	Password   string
+	Generation int64
+	CreatedAt  time.Time
+}
+
+// InstallSave is the result of accepting an install callback.
+type InstallSave struct {
+	CandidateID string
 	Generation  int64
-	Attempts    int
-	MaxAttempts int
-	LastError   string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// Created is false when the same credential is already active or pending.
+	Created bool
 }
 
 // DB wraps the SQLite database connection and provides storage operations.
@@ -84,16 +101,13 @@ type DB struct {
 	now    func() time.Time
 }
 
-// New opens or creates a SQLite database, runs migrations, and returns a DB handle.
-// PRAGMA settings (WAL, busy_timeout, foreign_keys) are applied via Exec after open,
-// because modernc.org/sqlite does not honour DSN query parameters.
-func New(dbPath string, encryptionKey []byte) (*DB, error) {
+// Open opens a SQLite database without applying migrations.
+func Open(dbPath string, encryptionKey []byte) (*DB, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	// Apply PRAGMA settings at runtime — DSN parameters are not supported by modernc.org/sqlite.
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA busy_timeout = 5000",
@@ -106,39 +120,45 @@ func New(dbPath string, encryptionKey []byte) (*DB, error) {
 		}
 	}
 
-	// Create AES-GCM cipher for password encryption
 	block, err := aes.NewCipher(encryptionKey)
 	if err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("create cipher: %w", err)
 	}
 	aesGCM, err := cipher.NewGCM(block)
 	if err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("new GCM: %w", err)
 	}
 
 	db.SetMaxOpenConns(1)
+	return &DB{db: db, aesGCM: aesGCM, now: time.Now}, nil
+}
 
-	s := &DB{db: db, aesGCM: aesGCM, now: time.Now}
-
-	if err := s.runMigrations(); err != nil {
-		return nil, fmt.Errorf("migrations: %w", err)
+// New opens a database and applies migrations.
+func New(dbPath string, encryptionKey []byte) (*DB, error) {
+	s, err := Open(dbPath, encryptionKey)
+	if err != nil {
+		return nil, err
 	}
-
+	if err := s.Upgrade(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
 // SetClock replaces the time source (used in tests).
 func (s *DB) SetClock(now func() time.Time) { s.now = now }
 
-// DB returns the underlying *sql.DB for advanced operations.
+// DB returns the underlying *sql.DB.
 func (s *DB) DB() *sql.DB { return s.db }
 
 // Close closes the database connection.
 func (s *DB) Close() error { return s.db.Close() }
 
-// runMigrations executes versioned migrations atomically.
-func (s *DB) runMigrations() error {
-	// Create migration tracking table
+// Upgrade applies any missing migrations.
+func (s *DB) Upgrade() error {
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_version (
 			version INTEGER PRIMARY KEY,
@@ -148,107 +168,289 @@ func (s *DB) runMigrations() error {
 		return fmt.Errorf("create schema_version: %w", err)
 	}
 
-	migrations := []struct {
+	steps := []struct {
 		version int
-		sql     string
+		apply   func() error
 	}{
-		{
-			version: 1,
-			sql: `
-				PRAGMA foreign_keys = ON;
-
-				CREATE TABLE IF NOT EXISTS stores (
-					id INTEGER PRIMARY KEY,
-					shop TEXT NOT NULL UNIQUE,
-					password TEXT NOT NULL,
-					title TEXT NOT NULL DEFAULT '',
-					generation INTEGER NOT NULL DEFAULT 1,
-					created_at TEXT NOT NULL DEFAULT (datetime('now'))
-				);
-
-				CREATE TABLE IF NOT EXISTS sessions (
-					id TEXT PRIMARY KEY,
-					store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
-					user_id TEXT NOT NULL,
-					generation INTEGER NOT NULL,
-					expires_at TEXT NOT NULL,
-					created_at TEXT NOT NULL DEFAULT (datetime('now'))
-				);
-
-				CREATE TABLE IF NOT EXISTS challenges (
-					id TEXT PRIMARY KEY,
-					store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
-					nonce TEXT NOT NULL,
-					browser_id TEXT NOT NULL,
-					expires_at TEXT NOT NULL,
-					created_at TEXT NOT NULL DEFAULT (datetime('now'))
-				);
-
-				CREATE TABLE IF NOT EXISTS candidates (
-					id TEXT PRIMARY KEY,
-					store_id INTEGER NOT NULL,
-					shop TEXT NOT NULL,
-					password TEXT NOT NULL,
-					generation INTEGER NOT NULL,
-					attempts INTEGER NOT NULL DEFAULT 0,
-					max_attempts INTEGER NOT NULL DEFAULT 3,
-					last_error TEXT NOT NULL DEFAULT '',
-					lease_token TEXT NOT NULL DEFAULT '',
-					next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
-					created_at TEXT NOT NULL DEFAULT (datetime('now')),
-					updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-				);
-
-				CREATE INDEX IF NOT EXISTS idx_candidates_claim ON candidates(attempts, next_attempt_at);
-				CREATE INDEX IF NOT EXISTS idx_candidates_store ON candidates(store_id);
-				CREATE INDEX IF NOT EXISTS idx_sessions_store ON sessions(store_id);
-				CREATE INDEX IF NOT EXISTS idx_challenges_store ON challenges(store_id);
-			`,
-		},
-		{
-			version: 2,
-			sql: `
-				ALTER TABLE stores ADD COLUMN installation_epoch INTEGER NOT NULL DEFAULT 1;
-				ALTER TABLE sessions ADD COLUMN installation_epoch INTEGER NOT NULL DEFAULT 1;
-				CREATE INDEX IF NOT EXISTS idx_stores_epoch ON stores(installation_epoch);
-			`,
-		},
+		{1, s.migrateV1},
+		{2, s.migrateV2},
+		{3, s.migrateV3},
 	}
-
-	for _, m := range migrations {
-		var exists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM schema_version WHERE version = ?", m.version).Scan(&exists)
+	for _, step := range steps {
+		applied, err := s.versionApplied(step.version)
 		if err != nil {
-			return fmt.Errorf("check migration %d: %w", m.version, err)
+			return err
 		}
-		if exists > 0 {
+		if applied {
 			continue
 		}
-
-		tx, err := s.db.Begin()
-		if err != nil {
-			return fmt.Errorf("begin migration %d: %w", m.version, err)
-		}
-
-		if _, err := tx.Exec(m.sql); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("apply migration %d: %w", m.version, err)
-		}
-
-		if _, err := tx.Exec("INSERT INTO schema_version (version) VALUES (?)", m.version); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("record migration %d: %w", m.version, err)
-		}
-
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %d: %w", m.version, err)
+		if err := step.apply(); err != nil {
+			return fmt.Errorf("apply migration %d: %w", step.version, err)
 		}
 	}
-
 	return nil
 }
 
-// encrypt encrypts plaintext using AES-GCM and returns hex-encoded ciphertext.
+func (s *DB) versionApplied(version int) (bool, error) {
+	var exists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM schema_version WHERE version = ?", version).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check migration %d: %w", version, err)
+	}
+	return exists > 0, nil
+}
+
+func (s *DB) recordVersion(tx *sql.Tx, version int) error {
+	_, err := tx.Exec("INSERT INTO schema_version (version) VALUES (?)", version)
+	return err
+}
+
+func (s *DB) migrateV1() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS stores (
+			id INTEGER PRIMARY KEY,
+			shop TEXT NOT NULL UNIQUE,
+			password TEXT NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			generation INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE IF NOT EXISTS sessions (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+			user_id TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE IF NOT EXISTS challenges (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+			nonce TEXT NOT NULL,
+			browser_id TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE IF NOT EXISTS candidates (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL,
+			shop TEXT NOT NULL,
+			password TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL DEFAULT 3,
+			last_error TEXT NOT NULL DEFAULT '',
+			lease_token TEXT NOT NULL DEFAULT '',
+			next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_candidates_claim ON candidates(attempts, next_attempt_at);
+		CREATE INDEX IF NOT EXISTS idx_candidates_store ON candidates(store_id);
+		CREATE INDEX IF NOT EXISTS idx_sessions_store ON sessions(store_id);
+		CREATE INDEX IF NOT EXISTS idx_challenges_store ON challenges(store_id);
+	`); err != nil {
+		return err
+	}
+	if err := s.recordVersion(tx, 1); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *DB) migrateV2() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		ALTER TABLE stores ADD COLUMN installation_epoch INTEGER NOT NULL DEFAULT 1;
+		ALTER TABLE sessions ADD COLUMN installation_epoch INTEGER NOT NULL DEFAULT 1;
+		CREATE INDEX IF NOT EXISTS idx_stores_epoch ON stores(installation_epoch);
+	`); err != nil {
+		return err
+	}
+	if err := s.recordVersion(tx, 2); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *DB) migrateV3() error {
+	if _, err := s.db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer func() { _, _ = s.db.Exec(`PRAGMA foreign_keys = ON`) }()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var maxGen sql.NullInt64
+	if err := tx.QueryRow(`
+		SELECT MAX(v) FROM (
+			SELECT generation AS v FROM stores
+			UNION ALL SELECT generation FROM candidates
+			UNION ALL SELECT installation_epoch FROM stores
+		)
+	`).Scan(&maxGen); err != nil {
+		return err
+	}
+	initial := int64(0)
+	if maxGen.Valid {
+		initial = maxGen.Int64 + 1
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE generation_counter (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			value INTEGER NOT NULL
+		)
+	`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO generation_counter (id, value) VALUES (1, ?)`, initial); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`
+		CREATE TABLE stores_v3 (
+			id INTEGER PRIMARY KEY,
+			shop TEXT NOT NULL,
+			password TEXT NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			generation INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		INSERT INTO stores_v3 (id, shop, password, title, generation, created_at)
+		SELECT id, shop, password, title, generation, created_at FROM stores;
+
+		CREATE TABLE candidates_v3 (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL,
+			shop TEXT NOT NULL,
+			password TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		);
+	`); err != nil {
+		return err
+	}
+
+	rows, err := tx.Query(`
+		SELECT id, store_id, shop, password, generation, created_at
+		FROM candidates
+		WHERE datetime(created_at) >= datetime('now', '-7 days')
+		ORDER BY shop, datetime(created_at) DESC, generation DESC, id DESC
+	`)
+	if err != nil {
+		return err
+	}
+	kept := map[string]int{}
+	type candRow struct {
+		id, shop, password, created string
+		storeID                     int
+		generation                  int64
+	}
+	var keep []candRow
+	for rows.Next() {
+		var c candRow
+		if err := rows.Scan(&c.id, &c.storeID, &c.shop, &c.password, &c.generation, &c.created); err != nil {
+			rows.Close()
+			return err
+		}
+		if kept[c.shop] >= MaxCandidatesPerShop {
+			continue
+		}
+		kept[c.shop]++
+		keep = append(keep, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, c := range keep {
+		if _, err := tx.Exec(`
+			INSERT INTO candidates_v3 (id, store_id, shop, password, generation, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, c.id, c.storeID, c.shop, c.password, c.generation, c.created); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`
+		DROP TABLE sessions;
+		DROP TABLE challenges;
+		DROP TABLE candidates;
+		DROP TABLE stores;
+		ALTER TABLE stores_v3 RENAME TO stores;
+		ALTER TABLE candidates_v3 RENAME TO candidates;
+		CREATE TABLE challenges (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+			nonce TEXT NOT NULL,
+			browser_id TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+			user_id TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX idx_candidates_shop ON candidates(shop, generation);
+		CREATE INDEX idx_candidates_store ON candidates(store_id);
+		CREATE INDEX idx_sessions_store ON sessions(store_id);
+		CREATE INDEX idx_challenges_store ON challenges(store_id);
+	`); err != nil {
+		return err
+	}
+	if err := s.recordVersion(tx, 3); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// AppliedVersions returns schema versions recorded in the database.
+// A missing schema_version table yields an empty slice.
+func (s *DB) AppliedVersions() ([]int, error) {
+	var name string
+	err := s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`).Scan(&name)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT version FROM schema_version ORDER BY version`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 func (s *DB) encrypt(plaintext []byte) (string, error) {
 	nonce := make([]byte, s.aesGCM.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
@@ -258,7 +460,6 @@ func (s *DB) encrypt(plaintext []byte) (string, error) {
 	return hex.EncodeToString(ciphertext), nil
 }
 
-// decrypt decrypts hex-encoded AES-GCM ciphertext.
 func (s *DB) decrypt(cipherHex string) ([]byte, error) {
 	ciphertext, err := hex.DecodeString(cipherHex)
 	if err != nil {
@@ -276,610 +477,721 @@ func (s *DB) decrypt(cipherHex string) ([]byte, error) {
 	return plaintext, nil
 }
 
-// --- Store operations ---
+func passwordsEqual(plain string, decrypted []byte) bool {
+	return subtle.ConstantTimeCompare([]byte(plain), decrypted) == 1
+}
 
-// CreateCandidate saves a pending installation candidate.
-// Returns ErrAlreadyExists if a candidate with the same ID already exists.
-func (s *DB) CreateCandidate(c *Candidate) error {
-	passEnc, err := s.encrypt([]byte(c.Password))
+func parseDBTime(value string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, nil
+	}
+	return time.ParseInLocation("2006-01-02 15:04:05", value, time.UTC)
+}
+
+func (s *DB) reserveGeneration(tx *sql.Tx) (int64, error) {
+	var gen int64
+	err := tx.QueryRow(`
+		UPDATE generation_counter
+		SET value = value + 1
+		WHERE id = 1
+		RETURNING value
+	`).Scan(&gen)
+	if err != nil {
+		return 0, fmt.Errorf("reserve generation: %w", err)
+	}
+	return gen, nil
+}
+
+// SaveInstall stores an install candidate or keeps the existing matching credential.
+func (s *DB) SaveInstall(candidateID string, storeID int, shop, password string) (InstallSave, error) {
+	passEnc, err := s.encrypt([]byte(password))
+	if err != nil {
+		return InstallSave{}, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return InstallSave{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.deleteExpiredCandidates(tx, shop); err != nil {
+		return InstallSave{}, err
+	}
+
+	active, err := s.readStoreTx(tx, storeID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return InstallSave{}, err
+	}
+	if active != nil && active.Shop == shop && passwordsEqual(password, []byte(active.Password)) {
+		if err := s.trimCandidates(tx, shop, MaxCandidatesPerShop, ""); err != nil {
+			return InstallSave{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return InstallSave{}, err
+		}
+		return InstallSave{Generation: active.Generation, Created: false}, nil
+	}
+
+	rows, err := s.candidatesForShop(tx, shop)
+	if err != nil {
+		return InstallSave{}, err
+	}
+	var keeper *Candidate
+	for i := range rows {
+		if passwordsEqual(password, []byte(rows[i].Password)) {
+			if keeper == nil || rows[i].Generation > keeper.Generation {
+				copyRow := rows[i]
+				keeper = &copyRow
+			}
+		}
+	}
+	if keeper != nil {
+		for _, row := range rows {
+			if row.ID != keeper.ID && passwordsEqual(password, []byte(row.Password)) {
+				if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, row.ID); err != nil {
+					return InstallSave{}, err
+				}
+			}
+		}
+		if err := s.trimCandidates(tx, shop, MaxCandidatesPerShop, keeper.ID); err != nil {
+			return InstallSave{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return InstallSave{}, err
+		}
+		return InstallSave{CandidateID: keeper.ID, Generation: keeper.Generation, Created: false}, nil
+	}
+
+	if err := s.trimCandidates(tx, shop, MaxCandidatesPerShop-1, ""); err != nil {
+		return InstallSave{}, err
+	}
+	gen, err := s.reserveGeneration(tx)
+	if err != nil {
+		return InstallSave{}, err
+	}
+	createdAt := s.now().UTC().Format(time.RFC3339)
+	if _, err := tx.Exec(`
+		INSERT INTO candidates (id, store_id, shop, password, generation, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, candidateID, storeID, shop, passEnc, gen, createdAt); err != nil {
+		return InstallSave{}, fmt.Errorf("insert candidate: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return InstallSave{}, err
+	}
+	return InstallSave{CandidateID: candidateID, Generation: gen, Created: true}, nil
+}
+
+func (s *DB) deleteExpiredCandidates(tx *sql.Tx, shop string) error {
+	rows, err := tx.Query(`SELECT id, created_at FROM candidates WHERE shop = ?`, shop)
 	if err != nil {
 		return err
 	}
-
-	// Enforce per-store candidate limit
-	var storeCount int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM candidates WHERE store_id = ?", c.StoreID).Scan(&storeCount); err != nil {
-		return fmt.Errorf("count candidates: %w", err)
+	defer rows.Close()
+	cutoff := s.now().Add(-CandidateTTL)
+	var drop []string
+	for rows.Next() {
+		var id, createdRaw string
+		if err := rows.Scan(&id, &createdRaw); err != nil {
+			return err
+		}
+		created, err := parseDBTime(createdRaw)
+		if err != nil {
+			return err
+		}
+		if created.Before(cutoff) {
+			drop = append(drop, id)
+		}
 	}
-	if storeCount >= 5 {
-		return fmt.Errorf("too many pending candidates for store %d (max 5)", c.StoreID)
+	if err := rows.Err(); err != nil {
+		return err
 	}
-
-	_, err = s.db.Exec(`
-		INSERT INTO candidates (id, store_id, shop, password, generation, max_attempts, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-	`, c.ID, c.StoreID, c.Shop, passEnc, c.Generation, c.MaxAttempts)
-	if err != nil {
-		return fmt.Errorf("insert candidate: %w", err)
+	for _, id := range drop {
+		if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// CreateCandidateAtomic atomically reserves the next generation and inserts a candidate.
-// Uses a transaction to prevent race conditions on generation assignment.
-// Enforces per-store and global candidate limits.
-func (s *DB) CreateCandidateAtomic(c *Candidate) error {
-	passEnc, err := s.encrypt([]byte(c.Password))
+func (s *DB) trimCandidates(tx *sql.Tx, shop string, keep int, protectID string) error {
+	if keep < 0 {
+		keep = 0
+	}
+	rows, err := tx.Query(`
+		SELECT id FROM candidates
+		WHERE shop = ?
+		ORDER BY created_at ASC, generation ASC, id ASC
+	`, shop)
 	if err != nil {
 		return err
 	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
 	}
-	defer tx.Rollback()
-
-	// Enforce per-store candidate limit
-	var storeCount int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM candidates WHERE store_id = ?", c.StoreID).Scan(&storeCount); err != nil {
-		return fmt.Errorf("count candidates: %w", err)
+	if err := rows.Err(); err != nil {
+		return err
 	}
-	if storeCount >= 5 {
-		return fmt.Errorf("too many pending candidates for store %d (max 5)", c.StoreID)
+	excess := len(ids) - keep
+	if protectID != "" {
+		// Защищённая запись не считается лишней.
+		removable := 0
+		for _, id := range ids {
+			if id != protectID {
+				removable++
+			}
+		}
+		if removable+1 <= keep {
+			excess = 0
+		}
 	}
-
-	// Enforce global candidate limit
-	var globalCount int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM candidates").Scan(&globalCount); err != nil {
-		return fmt.Errorf("count global candidates: %w", err)
+	removed := 0
+	for _, id := range ids {
+		if removed >= excess {
+			break
+		}
+		if id == protectID {
+			continue
+		}
+		if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
+			return err
+		}
+		removed++
 	}
-	if globalCount >= 100 {
-		return fmt.Errorf("too many pending candidates globally (max 100)")
-	}
-
-	// Atomically determine next generation under lock
-	var gen int64
-	err = tx.QueryRow(`
-		SELECT COALESCE(MAX(generation), 0) FROM (
-			SELECT generation FROM stores WHERE id = ?
-			UNION ALL
-			SELECT generation FROM candidates WHERE store_id = ?
-		)
-	`, c.StoreID, c.StoreID).Scan(&gen)
-	if err != nil {
-		return fmt.Errorf("get max generation: %w", err)
-	}
-	newGen := gen + 1
-
-	_, err = tx.Exec(`
-		INSERT INTO candidates (id, store_id, shop, password, generation, max_attempts, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-	`, c.ID, c.StoreID, c.Shop, passEnc, newGen, c.MaxAttempts)
-	if err != nil {
-		return fmt.Errorf("insert candidate: %w", err)
-	}
-
-	c.Generation = newGen
-
-	return tx.Commit()
+	return nil
 }
 
-// ClaimCandidate atomically claims a candidate for verification.
-// Uses a transaction to prevent concurrent claims.
-// Sets a lease token and next_attempt_at for retry/backoff.
-// If no candidate is available, returns nil, nil.
-func (s *DB) ClaimCandidate() (*Candidate, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	// Pick the next candidate with attempts remaining and lease expired
-	row := tx.QueryRow(`
-		SELECT id, store_id, shop, password, generation, attempts, max_attempts, last_error, created_at, updated_at
-		FROM candidates
-		WHERE attempts < max_attempts
-		  AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now'))
-		ORDER BY created_at ASC
-		LIMIT 1
-	`)
-
-	var c Candidate
-	var passEnc string
-	var createdAtStr, updatedAtStr string
-	var lastError sql.NullString
-	err = row.Scan(&c.ID, &c.StoreID, &c.Shop, &passEnc, &c.Generation, &c.Attempts, &c.MaxAttempts, &lastError, &createdAtStr, &updatedAtStr)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("scan candidate: %w", err)
-	}
-
-	if lastError.Valid {
-		c.LastError = lastError.String
-	}
-
-	plainPass, err := s.decrypt(passEnc)
+func (s *DB) candidatesForShop(tx *sql.Tx, shop string) ([]Candidate, error) {
+	rows, err := tx.Query(`
+		SELECT id, store_id, shop, password, generation, created_at
+		FROM candidates WHERE shop = ?
+	`, shop)
 	if err != nil {
 		return nil, err
 	}
-	c.Password = string(plainPass)
-	c.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAtStr)
-	c.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAtStr)
-
-	// Generate unique lease token
-	leaseToken := randomHex(16)
-
-	// Set next_attempt_at with exponential backoff (10s, 30s, 90s)
-	var backoffSeconds int
-	switch c.Attempts {
-	case 0:
-		backoffSeconds = 10
-	case 1:
-		backoffSeconds = 30
-	default:
-		backoffSeconds = 90
+	defer rows.Close()
+	var out []Candidate
+	for rows.Next() {
+		c, err := scanCandidate(rows, s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
 	}
+	return out, rows.Err()
+}
 
-	_, err = tx.Exec(`
-		UPDATE candidates
-		SET attempts = attempts + 1,
-		    lease_token = ?,
-		    next_attempt_at = datetime('now', '+' || ? || ' seconds'),
-		    updated_at = datetime('now')
-		WHERE id = ?
-	`, leaseToken, backoffSeconds, c.ID)
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanCandidate(rows rowScanner, s *DB) (Candidate, error) {
+	var c Candidate
+	var passEnc, createdRaw string
+	if err := rows.Scan(&c.ID, &c.StoreID, &c.Shop, &passEnc, &c.Generation, &createdRaw); err != nil {
+		return Candidate{}, err
+	}
+	plain, err := s.decrypt(passEnc)
 	if err != nil {
-		return nil, fmt.Errorf("update lease: %w", err)
+		return Candidate{}, err
 	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit claim: %w", err)
+	c.Password = string(plain)
+	c.CreatedAt, err = parseDBTime(createdRaw)
+	if err != nil {
+		return Candidate{}, err
 	}
-
-	return &c, nil
+	return c, nil
 }
 
-// randomHex returns cryptographically random hex string of n bytes.
-func randomHex(n int) string {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("failed to generate random: %v", err))
+// NewestPending returns the newest unexpired candidate for the store and shop.
+func (s *DB) NewestPending(storeID int, shop string) (*Candidate, error) {
+	rows, err := s.db.Query(`
+		SELECT id, store_id, shop, password, generation, created_at
+		FROM candidates
+		WHERE store_id = ? AND shop = ?
+	`, storeID, shop)
+	if err != nil {
+		return nil, err
 	}
-	return hex.EncodeToString(b)
+	defer rows.Close()
+	cutoff := s.now().Add(-CandidateTTL)
+	var best *Candidate
+	for rows.Next() {
+		c, err := scanCandidate(rows, s)
+		if err != nil {
+			return nil, err
+		}
+		if c.CreatedAt.Before(cutoff) {
+			continue
+		}
+		if best == nil || c.Generation > best.Generation {
+			copyC := c
+			best = &copyC
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return best, nil
 }
 
-// ReleaseLease releases the lease on a candidate, resetting attempt count
-// for retry on transient errors.
-func (s *DB) ReleaseLease(candidateID string) error {
-	_, err := s.db.Exec(`
-		UPDATE candidates
-		SET lease_token = '',
-		    attempts = GREATEST(attempts - 1, 0),
-		    updated_at = datetime('now')
-		WHERE id = ?
-	`, candidateID)
-	return err
+// HasOtherShop reports whether this store id is already bound to a different domain.
+func (s *DB) HasOtherShop(storeID int, shop string) (bool, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM stores WHERE id = ? AND shop != ?`, storeID, shop).Scan(&n); err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM candidates WHERE store_id = ? AND shop != ?`, storeID, shop).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
-// FailCandidate records a transient failure for a candidate.
-// Sets last_error and schedules retry via next_attempt_at.
-func (s *DB) FailCandidate(candidateID, lastError string, retryAfter int) error {
-	_, err := s.db.Exec(`
-		UPDATE candidates
-		SET last_error = ?,
-		    next_attempt_at = datetime('now', '+' || ? || ' seconds'),
-		    updated_at = datetime('now')
-		WHERE id = ?
-	`, lastError, retryAfter, candidateID)
-	return err
+// CountCandidates returns how many candidates exist for a shop.
+func (s *DB) CountCandidates(shop string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM candidates WHERE shop = ?`, shop).Scan(&n)
+	return n, err
 }
 
-// CompleteCandidate removes a candidate after successful promotion.
-func (s *DB) CompleteCandidate(candidateID string) error {
-	_, err := s.db.Exec("DELETE FROM candidates WHERE id = ?", candidateID)
-	return err
-}
-
-// PromoteCandidate moves a verified candidate to the stores table.
-// It atomically checks that the candidate is still valid (not cancelled),
-// and that the generation matches or is newer than the current store.
-func (s *DB) PromoteCandidate(candidateID string, title string) (bool, error) {
+// ActivateCandidate promotes a candidate when it is still the newest installation.
+// activated is false when the row was removed or a newer connection is already active.
+func (s *DB) ActivateCandidate(candidateID, title string) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return false, fmt.Errorf("begin tx: %w", err)
+		return false, err
 	}
 	defer tx.Rollback()
 
-	// Re-read candidate within transaction
-	var c struct {
-		id         string
-		storeID    int
-		shop       string
-		passEnc    string
-		generation int64
-	}
+	var c Candidate
+	var passEnc, createdRaw string
 	err = tx.QueryRow(`
-		SELECT id, store_id, shop, password, generation FROM candidates WHERE id = ?
-	`, candidateID).Scan(&c.id, &c.storeID, &c.shop, &c.passEnc, &c.generation)
+		SELECT id, store_id, shop, password, generation, created_at
+		FROM candidates WHERE id = ?
+	`, candidateID).Scan(&c.ID, &c.StoreID, &c.Shop, &passEnc, &c.Generation, &createdRaw)
 	if err == sql.ErrNoRows {
-		return false, nil // cancelled or already processed
+		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("re-read candidate: %w", err)
+		return false, err
 	}
-
-	// Check current store generation (if exists)
-	var currentGen int64
-	err = tx.QueryRow("SELECT COALESCE(MAX(generation), 0) FROM stores WHERE id = ?", c.storeID).Scan(&currentGen)
+	created, err := parseDBTime(createdRaw)
 	if err != nil {
-		return false, fmt.Errorf("check current gen: %w", err)
+		return false, err
+	}
+	if created.Before(s.now().Add(-CandidateTTL)) {
+		if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, candidateID); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
 	}
 
-	// Only promote if our generation >= current (candidate is newer or equal)
-	if c.generation < currentGen {
-		slog.Debug("candidate generation older than current, skipping", "store", c.storeID, "candidateGen", c.generation, "currentGen", currentGen)
+	var activeGen sql.NullInt64
+	if err := tx.QueryRow(`SELECT generation FROM stores WHERE id = ?`, c.StoreID).Scan(&activeGen); err != nil && err != sql.ErrNoRows {
+		return false, err
+	}
+	if activeGen.Valid && c.Generation <= activeGen.Int64 {
 		return false, nil
 	}
 
-	// Upsert store — increment installation_epoch on reinstall to prevent
-	// cross-installation session reuse.
-	var currentEpoch int64
-	err = tx.QueryRow("SELECT COALESCE(MAX(installation_epoch), 0) FROM stores WHERE id = ?", c.storeID).Scan(&currentEpoch)
-	if err != nil {
-		return false, fmt.Errorf("check current epoch: %w", err)
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE store_id = ?`, c.StoreID); err != nil {
+		return false, err
 	}
-	newEpoch := currentEpoch + 1
-
-	_, err = tx.Exec(`
-		INSERT INTO stores (id, shop, password, title, generation, installation_epoch, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+	if _, err := tx.Exec(`DELETE FROM challenges WHERE store_id = ?`, c.StoreID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO stores (id, shop, password, title, generation, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			shop = excluded.shop,
 			password = excluded.password,
 			title = excluded.title,
 			generation = excluded.generation,
-			installation_epoch = excluded.installation_epoch,
-			created_at = datetime('now')
-	`, c.storeID, c.shop, c.passEnc, title, c.generation, newEpoch)
-	if err != nil {
-		return false, fmt.Errorf("upsert store: %w", err)
+			created_at = excluded.created_at
+	`, c.StoreID, c.Shop, passEnc, title, c.Generation, s.now().UTC().Format(time.RFC3339)); err != nil {
+		return false, err
 	}
-
-	// Delete candidate
-	_, err = tx.Exec("DELETE FROM candidates WHERE id = ?", candidateID)
+	res, err := tx.Exec(`DELETE FROM candidates WHERE id = ? AND generation = ?`, candidateID, c.Generation)
 	if err != nil {
-		return false, fmt.Errorf("delete candidate: %w", err)
+		return false, err
 	}
-
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return false, nil
+	}
 	return true, tx.Commit()
 }
 
-// CancelCandidate removes candidates for a store that have a lower generation,
-// or all candidates matching storeID+generation.
-func (s *DB) CancelCandidate(storeID int, generation int64) error {
-	_, err := s.db.Exec("DELETE FROM candidates WHERE store_id = ? AND generation <= ?", storeID, generation)
+// DeleteCandidate removes one pending install.
+func (s *DB) DeleteCandidate(candidateID string) error {
+	_, err := s.db.Exec(`DELETE FROM candidates WHERE id = ?`, candidateID)
 	return err
 }
 
-// GetActiveStore returns the active store for the given insales_id.
+// GetActiveStore returns the verified connection for an insales id.
 func (s *DB) GetActiveStore(storeID int) (*Store, error) {
+	return s.readStore(storeID)
+}
+
+func (s *DB) readStore(storeID int) (*Store, error) {
 	var store Store
-	var passEnc string
-	var createdAtStr string
+	var passEnc, createdRaw string
 	err := s.db.QueryRow(`
-		SELECT id, shop, password, title, generation, installation_epoch, created_at
+		SELECT id, shop, password, title, generation, created_at
 		FROM stores WHERE id = ?
-	`, storeID).Scan(&store.ID, &store.Shop, &passEnc, &store.Title, &store.Generation, &store.InstallationEpoch, &createdAtStr)
+	`, storeID).Scan(&store.ID, &store.Shop, &passEnc, &store.Title, &store.Generation, &createdRaw)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("get store: %w", err)
+		return nil, err
 	}
-
-	plainPass, err := s.decrypt(passEnc)
+	plain, err := s.decrypt(passEnc)
 	if err != nil {
 		return nil, err
 	}
-	store.Password = string(plainPass)
-	store.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAtStr)
-
+	store.Password = string(plain)
+	store.CreatedAt, err = parseDBTime(createdRaw)
+	if err != nil {
+		return nil, err
+	}
 	return &store, nil
 }
 
-// GetStoreByShop returns a store by its shop domain.
-func (s *DB) GetStoreByShop(shop string) (*Store, error) {
+func (s *DB) readStoreTx(tx *sql.Tx, storeID int) (*Store, error) {
 	var store Store
-	var passEnc string
-	var createdAtStr string
-	err := s.db.QueryRow(`
-		SELECT id, shop, password, title, generation, installation_epoch, created_at
-		FROM stores WHERE shop = ?
-	`, shop).Scan(&store.ID, &store.Shop, &passEnc, &store.Title, &store.Generation, &store.InstallationEpoch, &createdAtStr)
+	var passEnc, createdRaw string
+	err := tx.QueryRow(`
+		SELECT id, shop, password, title, generation, created_at
+		FROM stores WHERE id = ?
+	`, storeID).Scan(&store.ID, &store.Shop, &passEnc, &store.Title, &store.Generation, &createdRaw)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("get store by shop: %w", err)
+		return nil, err
 	}
-
-	plainPass, err := s.decrypt(passEnc)
+	plain, err := s.decrypt(passEnc)
 	if err != nil {
 		return nil, err
 	}
-	store.Password = string(plainPass)
-	store.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAtStr)
-
+	store.Password = string(plain)
+	store.CreatedAt, err = parseDBTime(createdRaw)
+	if err != nil {
+		return nil, err
+	}
 	return &store, nil
 }
 
-// UninstallStore removes a store and all its related data in a single write-transaction.
-//
-// It verifies the password against the ACTIVE store first (full removal of store +
-// sessions + challenges + candidates). If the password matches a CANDIDATE instead
-// (pending verification), only that candidate and its matching store data are removed.
-//
-// The entire check and deletion happens atomically inside one write-transaction,
-// preventing TOCTOU races (finding #4). Blanket delete by store_id is only performed
-// when the active credential matches (fixing #5). All candidates are scanned for a
-// password match, not just the latest (fixing #6).
-//
-// Returns (removed, error). removed=false with nil error means nothing found (idempotent).
-func (s *DB) UninstallStore(storeID int, password string) (bool, error) {
+// GetStoreByShop returns a verified connection by canonical shop domain.
+func (s *DB) GetStoreByShop(shop string) (*Store, error) {
+	var id int
+	err := s.db.QueryRow(`SELECT id FROM stores WHERE shop = ?`, shop).Scan(&id)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.readStore(id)
+}
+
+// ListStores returns verified connections.
+func (s *DB) ListStores() ([]Store, error) {
+	rows, err := s.db.Query(`SELECT id FROM stores ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []Store
+	for _, id := range ids {
+		store, err := s.readStore(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *store)
+	}
+	return out, nil
+}
+
+// Uninstall removes the connection that matches insales id, shop and credential.
+// removed is false when nothing matched. ErrNotAuthorized means the pair exists
+// but the password does not.
+func (s *DB) Uninstall(storeID int, shop, password string) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return false, fmt.Errorf("begin tx: %w", err)
+		return false, err
 	}
 	defer tx.Rollback()
 
-	// 1. Check active store password inside transaction
-	var activePassEnc sql.NullString
-	err = tx.QueryRow("SELECT password FROM stores WHERE id = ?", storeID).Scan(&activePassEnc)
-	if err != nil && err != sql.ErrNoRows {
-		return false, fmt.Errorf("read active store password: %w", err)
+	active, err := s.readStoreTx(tx, storeID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return false, err
 	}
+	activeHere := active != nil && active.Shop == shop
+	activeMatch := activeHere && passwordsEqual(password, []byte(active.Password))
 
-	activeMatch := false
-	if activePassEnc.Valid {
-		plainPass, decErr := s.decrypt(activePassEnc.String)
-		if decErr != nil {
-			return false, fmt.Errorf("decrypt active password: %w", decErr)
-		}
-		if subtle.ConstantTimeCompare(plainPass, []byte(password)) == 1 {
-			activeMatch = true
-		}
-	}
-
-	if activeMatch {
-		// Full uninstall — delete everything for this store
-		if _, err := tx.Exec("DELETE FROM candidates WHERE store_id = ?", storeID); err != nil {
-			return false, fmt.Errorf("delete candidates: %w", err)
-		}
-		if _, err := tx.Exec("DELETE FROM challenges WHERE store_id = ?", storeID); err != nil {
-			return false, fmt.Errorf("delete challenges: %w", err)
-		}
-		if _, err := tx.Exec("DELETE FROM sessions WHERE store_id = ?", storeID); err != nil {
-			return false, fmt.Errorf("delete sessions: %w", err)
-		}
-		if _, err := tx.Exec("DELETE FROM stores WHERE id = ?", storeID); err != nil {
-			return false, fmt.Errorf("delete store: %w", err)
-		}
-		return true, tx.Commit()
-	}
-
-	// 2. Check all candidates for a password match (not just the latest generation)
-	var candidateIDs []string
-	var hadCandidates bool
-	rows, err := tx.Query("SELECT id, password FROM candidates WHERE store_id = ?", storeID)
+	rows, err := tx.Query(`SELECT id, password FROM candidates WHERE store_id = ? AND shop = ?`, storeID, shop)
 	if err != nil {
-		return false, fmt.Errorf("read candidates: %w", err)
+		return false, err
 	}
-	defer rows.Close()
-
+	var matched []string
+	hadPending := false
 	for rows.Next() {
-		hadCandidates = true
-		var cID, cPassEnc string
-		if err := rows.Scan(&cID, &cPassEnc); err != nil {
-			return false, fmt.Errorf("scan candidate: %w", err)
+		hadPending = true
+		var id, passEnc string
+		if err := rows.Scan(&id, &passEnc); err != nil {
+			rows.Close()
+			return false, err
 		}
-		plainPass, decErr := s.decrypt(cPassEnc)
-		if decErr != nil {
-			return false, fmt.Errorf("decrypt candidate password: %w", decErr)
+		plain, err := s.decrypt(passEnc)
+		if err != nil {
+			rows.Close()
+			return false, err
 		}
-		if subtle.ConstantTimeCompare(plainPass, []byte(password)) == 1 {
-			candidateIDs = append(candidateIDs, cID)
+		if passwordsEqual(password, plain) {
+			matched = append(matched, id)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return false, fmt.Errorf("rows iteration: %w", err)
+		rows.Close()
+		return false, err
 	}
+	rows.Close()
 
-	if len(candidateIDs) > 0 {
-		// Cancel matching candidates only — do NOT touch active store or other credentials
-		for _, cid := range candidateIDs {
-			if _, err := tx.Exec("DELETE FROM candidates WHERE id = ?", cid); err != nil {
-				return false, fmt.Errorf("delete candidate %s: %w", cid, err)
+	if activeMatch {
+		for _, id := range matched {
+			if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
+				return false, err
+			}
+		}
+		if _, err := tx.Exec(`DELETE FROM sessions WHERE store_id = ?`, storeID); err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec(`DELETE FROM challenges WHERE store_id = ?`, storeID); err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec(`DELETE FROM stores WHERE id = ?`, storeID); err != nil {
+			return false, err
+		}
+		return true, tx.Commit()
+	}
+	if len(matched) > 0 {
+		for _, id := range matched {
+			if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
+				return false, err
 			}
 		}
 		return true, tx.Commit()
 	}
-
-	// 3. Nothing matched
-	if activePassEnc.Valid {
-		// Active store exists but wrong password, no matching candidates
+	if activeHere || hadPending {
 		return false, ErrNotAuthorized
 	}
-
-	if hadCandidates {
-		// Candidates exist but none matched the password
-		return false, ErrNotAuthorized
-	}
-
-	// No store, no candidates — idempotent
 	return false, nil
 }
 
-// --- Session operations ---
-
-// CreateSession creates a new browser session.
-func (s *DB) CreateSession(id string, storeID int, userID string, generation int64, installationEpoch int64, ttl time.Duration) error {
-	expires := s.now().Add(ttl)
-	_, err := s.db.Exec(`
-		INSERT INTO sessions (id, store_id, user_id, generation, installation_epoch, expires_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-	`, id, storeID, userID, generation, installationEpoch, expires.Format(time.RFC3339))
-	return err
-}
-
-// GetSession retrieves a session and checks it hasn't expired.
-func (s *DB) GetSession(id string) (*Session, error) {
-	var sess Session
-	var expiresStr string
-	err := s.db.QueryRow(`
-		SELECT s.id, s.store_id, s.user_id, s.generation, s.installation_epoch, s.expires_at
-		FROM sessions s
-		WHERE s.id = ?
-	`, id).Scan(&sess.ID, &sess.StoreID, &sess.UserID, &sess.Generation, &sess.InstallationEpoch, &expiresStr)
-	if err == sql.ErrNoRows {
-		return nil, ErrNotFound
+func (s *DB) cleanupExpired(tx *sql.Tx) error {
+	now := s.now().UTC().Format(time.RFC3339)
+	if _, err := tx.Exec(`DELETE FROM challenges WHERE expires_at <= ?`, now); err != nil {
+		return err
 	}
-	if err != nil {
-		return nil, fmt.Errorf("get session: %w", err)
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE expires_at <= ?`, now); err != nil {
+		return err
 	}
-
-	sess.ExpiresAt, err = time.Parse(time.RFC3339, expiresStr)
-	if err != nil {
-		return nil, fmt.Errorf("parse expires: %w", err)
-	}
-
-	if s.now().After(sess.ExpiresAt) {
-		// Ошибку удаления не возвращаем: сессия уже истекла, повтор будет в CleanupExpired.
-		_, _ = s.db.Exec("DELETE FROM sessions WHERE id = ?", id)
-		return nil, ErrNotFound
-	}
-
-	return &sess, nil
+	return nil
 }
 
-// DeleteSession removes a single session.
-func (s *DB) DeleteSession(id string) error {
-	_, err := s.db.Exec("DELETE FROM sessions WHERE id = ?", id)
-	return err
-}
-
-// DeleteStoreSessions removes all sessions for a store.
-func (s *DB) DeleteStoreSessions(storeID int) error {
-	_, err := s.db.Exec("DELETE FROM sessions WHERE store_id = ?", storeID)
-	return err
-}
-
-// --- Challenge operations ---
-
-// CreateChallenge creates a one-time login challenge.
-func (s *DB) CreateChallenge(id string, storeID int, nonce string, browserID string, ttl time.Duration) error {
-	expires := s.now().Add(ttl)
-	_, err := s.db.Exec(`
-		INSERT INTO challenges (id, store_id, nonce, browser_id, expires_at, created_at)
-		VALUES (?, ?, ?, ?, ?, datetime('now'))
-	`, id, storeID, nonce, browserID, expires.Format(time.RFC3339))
-	return err
-}
-
-// ConsumeChallenge atomically reads and deletes a challenge.
-// Returns the challenge if it exists, hasn't expired, and is bound to the given browser.
-func (s *DB) ConsumeChallenge(id string, browserID string) (*Challenge, error) {
+// CreateChallenge stores a nonce bound to the store's current generation.
+func (s *DB) CreateChallenge(id, nonce, browserID string, storeID int, ttl time.Duration) (int64, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := s.cleanupExpired(tx); err != nil {
+		return 0, err
+	}
+	expires := s.now().Add(ttl).UTC().Format(time.RFC3339)
+	created := s.now().UTC().Format(time.RFC3339)
+	res, err := tx.Exec(`
+		INSERT INTO challenges (id, store_id, nonce, browser_id, generation, expires_at, created_at)
+		SELECT ?, id, ?, ?, generation, ?, ?
+		FROM stores
+		WHERE id = ?
+	`, id, nonce, browserID, expires, created, storeID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return 0, ErrNotFound
+	}
+	var gen int64
+	if err := tx.QueryRow(`SELECT generation FROM challenges WHERE id = ?`, id).Scan(&gen); err != nil {
+		return 0, err
+	}
+	return gen, tx.Commit()
+}
+
+// ConsumeChallenge reads and deletes a challenge bound to the browser and current generation.
+func (s *DB) ConsumeChallenge(id, browserID string) (*Challenge, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
 	}
 	defer tx.Rollback()
 
 	var ch Challenge
-	var expiresStr string
+	var expiresRaw string
 	err = tx.QueryRow(`
-		SELECT id, store_id, nonce, browser_id, expires_at
+		SELECT id, store_id, nonce, browser_id, generation, expires_at
 		FROM challenges WHERE id = ?
-	`, id).Scan(&ch.ID, &ch.StoreID, &ch.Nonce, &ch.BrowserID, &expiresStr)
+	`, id).Scan(&ch.ID, &ch.StoreID, &ch.Nonce, &ch.BrowserID, &ch.Generation, &expiresRaw)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("scan challenge: %w", err)
+		return nil, err
 	}
-
-	ch.ExpiresAt, err = time.Parse(time.RFC3339, expiresStr)
+	ch.ExpiresAt, err = parseDBTime(expiresRaw)
 	if err != nil {
-		return nil, fmt.Errorf("parse expires: %w", err)
+		return nil, err
 	}
-
-	// Check expiry
-	if s.now().After(ch.ExpiresAt) {
-		if _, err := tx.Exec("DELETE FROM challenges WHERE id = ?", id); err != nil {
-			return nil, fmt.Errorf("delete expired challenge: %w", err)
+	if !s.now().Before(ch.ExpiresAt) {
+		if _, err := tx.Exec(`DELETE FROM challenges WHERE id = ?`, id); err != nil {
+			return nil, err
 		}
 		if err := tx.Commit(); err != nil {
-			return nil, fmt.Errorf("commit delete expired challenge: %w", err)
+			return nil, err
 		}
 		return nil, ErrNotFound
 	}
-
-	// Check browser binding
 	if ch.BrowserID != browserID {
 		return nil, ErrNotAuthorized
 	}
-
-	// Atomically delete (consume) the challenge
-	result, err := tx.Exec("DELETE FROM challenges WHERE id = ?", id)
+	var storeGen int64
+	err = tx.QueryRow(`SELECT generation FROM stores WHERE id = ?`, ch.StoreID).Scan(&storeGen)
+	if err == sql.ErrNoRows || (err == nil && storeGen != ch.Generation) {
+		if _, delErr := tx.Exec(`DELETE FROM challenges WHERE id = ?`, id); delErr != nil {
+			return nil, delErr
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, ErrStale
+	}
 	if err != nil {
-		return nil, fmt.Errorf("delete challenge: %w", err)
+		return nil, err
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return nil, ErrNotFound
+	if _, err := tx.Exec(`DELETE FROM challenges WHERE id = ?`, id); err != nil {
+		return nil, err
 	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit: %w", err)
-	}
-
-	return &ch, nil
+	return &ch, tx.Commit()
 }
 
-// DeleteStoreChallenges removes all challenges for a store.
-func (s *DB) DeleteStoreChallenges(storeID int) error {
-	_, err := s.db.Exec("DELETE FROM challenges WHERE store_id = ?", storeID)
+// CreateSession stores a session for the generation that is still current.
+func (s *DB) CreateSession(id string, storeID int, userID string, generation int64, ttl time.Duration) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.cleanupExpired(tx); err != nil {
+		return err
+	}
+	expires := s.now().Add(ttl).UTC().Format(time.RFC3339)
+	created := s.now().UTC().Format(time.RFC3339)
+	res, err := tx.Exec(`
+		INSERT INTO sessions (id, store_id, user_id, generation, expires_at, created_at)
+		SELECT ?, id, ?, generation, ?, ?
+		FROM stores
+		WHERE id = ? AND generation = ?
+	`, id, userID, expires, created, storeID, generation)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrStale
+	}
+	return tx.Commit()
+}
+
+// VerifySession loads a session and its store when the generation still matches.
+func (s *DB) VerifySession(sessionID string) (*Session, *Store, error) {
+	var sess Session
+	var store Store
+	var passEnc, expiresRaw, createdRaw string
+	err := s.db.QueryRow(`
+		SELECT s.id, s.store_id, s.user_id, s.generation, s.expires_at,
+		       st.shop, st.password, st.title, st.generation, st.created_at
+		FROM sessions s
+		JOIN stores st ON st.id = s.store_id AND st.generation = s.generation
+		WHERE s.id = ?
+	`, sessionID).Scan(
+		&sess.ID, &sess.StoreID, &sess.UserID, &sess.Generation, &expiresRaw,
+		&store.Shop, &passEnc, &store.Title, &store.Generation, &createdRaw,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	sess.ExpiresAt, err = parseDBTime(expiresRaw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !s.now().Before(sess.ExpiresAt) {
+		return nil, nil, ErrNotFound
+	}
+	plain, err := s.decrypt(passEnc)
+	if err != nil {
+		return nil, nil, err
+	}
+	store.ID = sess.StoreID
+	store.Password = string(plain)
+	store.CreatedAt, err = parseDBTime(createdRaw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &sess, &store, nil
+}
+
+// DeleteSession removes one session.
+func (s *DB) DeleteSession(id string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
 	return err
 }
 
-// GetStoreGeneration returns the current generation for a store.
-func (s *DB) GetStoreGeneration(storeID int) (int64, error) {
-	var gen int64
-	err := s.db.QueryRow("SELECT COALESCE(MAX(generation), 0) FROM stores WHERE id = ?", storeID).Scan(&gen)
-	return gen, err
-}
-
-// GetLastCandidateGeneration returns the latest generation from candidates for a store.
-func (s *DB) GetLastCandidateGeneration(storeID int) (int64, error) {
-	var gen int64
-	err := s.db.QueryRow("SELECT COALESCE(MAX(generation), 0) FROM candidates WHERE store_id = ?", storeID).Scan(&gen)
-	return gen, err
-}
-
-// CleanupExpired removes expired sessions and challenges.
-func (s *DB) CleanupExpired() {
-	now := s.now().Format(time.RFC3339)
-	// Сбой очистки не останавливает воркер: строки будут подобраны на следующем цикле.
-	_, _ = s.db.Exec("DELETE FROM sessions WHERE expires_at < ?", now)
-	_, _ = s.db.Exec("DELETE FROM challenges WHERE expires_at < ?", now)
-}
-
-// HasStore checks if a store exists by ID.
-func (s *DB) HasStore(storeID int) (bool, error) {
-	var count int
-	err := s.db.QueryRow("SELECT COUNT(*) FROM stores WHERE id = ?", storeID).Scan(&count)
-	return count > 0, err
+// GenerationValue returns the last reserved generation, or 0 when the counter is absent.
+func (s *DB) GenerationValue() (int64, error) {
+	var v int64
+	err := s.db.QueryRow(`SELECT value FROM generation_counter WHERE id = 1`).Scan(&v)
+	if err == sql.ErrNoRows {
+		return 0, ErrNotFound
+	}
+	return v, err
 }

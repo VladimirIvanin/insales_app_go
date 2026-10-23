@@ -1,4 +1,4 @@
-// Package httpapp provides the HTTP server, routes, middleware and templates
+// Package httpapp provides the HTTP server, routes and templates
 // for the InSales partner application.
 package httpapp
 
@@ -30,12 +30,10 @@ var templateFS embed.FS
 type App struct {
 	cfg       *config.Config
 	lifecycle *lifecycle.Service
-	store     interface{ Close() error }
 	storeDB   *storage.DB
 	tmpls     *template.Template
 	server    *http.Server
-	verifyCh  chan struct{} // signal to re-check candidates
-	isSecure  bool          // whether cookies should have Secure flag
+	isSecure  bool
 }
 
 // DashboardData represents data for the dashboard template.
@@ -61,20 +59,13 @@ func New(cfg *config.Config, lc *lifecycle.Service, storeDB *storage.DB) (*App, 
 		return nil, fmt.Errorf("parse templates: %w", err)
 	}
 
-	verifyCh := make(chan struct{}, 1)
-
 	app := &App{
 		cfg:       cfg,
 		lifecycle: lc,
-		store:     storeDB,
 		storeDB:   storeDB,
 		tmpls:     tmpls,
-		verifyCh:  verifyCh,
 		isSecure:  strings.HasPrefix(cfg.BaseURL, "https://"),
 	}
-
-	// Start background candidate verification worker
-	go app.verificationWorker()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/install", app.handleInstall)
@@ -86,12 +77,9 @@ func New(cfg *config.Config, lc *lifecycle.Service, storeDB *storage.DB) (*App, 
 	mux.HandleFunc("/probe", app.handleProbe)
 	mux.HandleFunc("/", app.handleDashboard)
 
-	// Wrap with CSRF protection middleware for state-changing endpoints
-	handler := csrfMiddleware(sessionMiddleware(app, mux))
-
 	app.server = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.BindHost, cfg.Port),
-		Handler:      handler,
+		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  30 * time.Second,
@@ -115,107 +103,6 @@ func (a *App) Shutdown(ctx context.Context) error {
 // This is used in tests to build test servers via httptest.NewServer.
 func (a *App) Handler() http.Handler {
 	return a.server.Handler
-}
-
-// verificationWorker processes candidate verifications in background.
-// Reads candidates from the storage queue, retries on failure with backoff
-// managed by ClaimCandidate/FailCandidate, and periodically polls for
-// candidates whose next_attempt_at has elapsed.
-func (a *App) verificationWorker() {
-	ctx := context.Background()
-
-	poll := func() {
-		for {
-			candidate, err := a.storeDB.ClaimCandidate()
-			if err != nil {
-				slog.Error("claim candidate", "error", err)
-				return
-			}
-			if candidate == nil {
-				return // no candidates available
-			}
-
-			slog.Info("verifying install candidate", "store", candidate.StoreID, "shop", candidate.Shop, "attempt", candidate.Attempts)
-
-			err = a.lifecycle.VerifyInstall(ctx, candidate)
-			if err != nil {
-				// Determine retry delay from error type
-				retryAfter := 30
-				if insales.IsTransientError(err) {
-					retryAfter = 10
-				}
-				var apiErr *insales.APIError
-				if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
-					retryAfter = apiErr.RetryAfter
-				}
-
-				if failErr := a.storeDB.FailCandidate(candidate.ID, err.Error(), retryAfter); failErr != nil {
-					slog.Error("fail candidate", "candidate", candidate.ID, "error", failErr)
-				}
-				slog.Warn("verification failed, will retry", "store", candidate.StoreID, "retryAfter", retryAfter, "error", err)
-				continue
-			}
-
-			slog.Info("verification succeeded", "store", candidate.StoreID, "shop", candidate.Shop)
-		}
-	}
-
-	// Initial poll on startup (catches candidates from before restart)
-	poll()
-
-	// Periodic poll — catches candidates whose next_attempt_at has elapsed
-	// even when no new install signal arrives.
-	pollTicker := time.NewTicker(30 * time.Second)
-	defer pollTicker.Stop()
-
-	// Periodic cleanup of expired sessions and challenges (every 5 minutes)
-	cleanupTicker := time.NewTicker(5 * time.Minute)
-	defer cleanupTicker.Stop()
-
-	for {
-		select {
-		case <-a.verifyCh:
-			poll()
-		case <-pollTicker.C:
-			poll()
-		case <-cleanupTicker.C:
-			a.storeDB.CleanupExpired()
-		}
-	}
-}
-
-// sessionMiddleware extracts the session cookie and injects it into the request context.
-func sessionMiddleware(app *App, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip session check for public routes
-		publicRoutes := map[string]bool{
-			"/install":   true,
-			"/login":     true,
-			"/uninstall": true,
-			"/healthz":   true,
-		}
-		if publicRoutes[r.URL.Path] {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// For session-protected routes, check cookie
-		if r.URL.Path == "/auth/callback" {
-			// Auth callback is special — it should have a challenge cookie
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// csrfMiddleware protects POST endpoints from CSRF.
-// Uses SameSite=Lax cookie as primary protection.
-func csrfMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-	})
 }
 
 // getSessionID extracts the session ID from the cookie.
@@ -376,14 +263,7 @@ func (a *App) handleInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Signal background verification
-	select {
-	case a.verifyCh <- struct{}{}:
-	default:
-		slog.Warn("verification worker busy, candidate will be processed on next poll cycle")
-	}
-
-	slog.Info("install callback processed", "shop", shop, "insales_id", insalesID, "candidate", result.CandidateID)
+	slog.Info("install accepted", "shop", shop, "insales_id", insalesID, "pending", result.Created)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := a.tmpls.ExecuteTemplate(w, "install_ok.html", nil); err != nil {
@@ -400,10 +280,13 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	shop := r.URL.Query().Get("shop")
 	insalesIDStr := r.URL.Query().Get("insales_id")
-	userID := r.URL.Query().Get("user_id")
 
 	if shop == "" || insalesIDStr == "" {
 		writeError(w, a.tmpls, "Неверные параметры входа", http.StatusBadRequest)
+		return
+	}
+	if len(r.URL.Query()["shop"]) != 1 || len(r.URL.Query()["insales_id"]) != 1 {
+		writeError(w, a.tmpls, "Повторяющиеся параметры запроса", http.StatusBadRequest)
 		return
 	}
 
@@ -415,17 +298,34 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		insalesID = id
 	}
 
-	// Get or create browser binding
+	shopURL, err := insales.ValidateShopURL(shop, a.cfg.AllowedShops)
+	if err != nil {
+		writeError(w, a.tmpls, "Магазин не найден в списке разрешённых", http.StatusForbidden)
+		return
+	}
+	shop = strings.TrimPrefix(shopURL, "https://")
+
 	browserID := a.getOrCreateBrowserID(r, w)
 
-	result, err := a.lifecycle.HandleLogin(lifecycle.LoginParams{
+	result, err := a.lifecycle.HandleLogin(r.Context(), lifecycle.LoginParams{
 		Shop:      shop,
 		InsalesID: insalesID,
-		UserID:    userID,
 	}, browserID)
 	if err != nil {
-		if err == lifecycle.ErrStoreNotInstalled {
+		if errors.Is(err, lifecycle.ErrStoreNotInstalled) {
 			writeError(w, a.tmpls, "Магазин не установлен", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, lifecycle.ErrForbidden) {
+			writeError(w, a.tmpls, "Подключение отклонено", http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, lifecycle.ErrTemporary) {
+			writeError(w, a.tmpls, "Временная ошибка проверки подключения. Повторите вход.", http.StatusServiceUnavailable)
+			return
+		}
+		if errors.Is(err, lifecycle.ErrVerification) {
+			writeError(w, a.tmpls, "Не удалось проверить ответ магазина. Повторите вход.", http.StatusBadGateway)
 			return
 		}
 		slog.Error("login failed", "shop", shop, "error", err)
@@ -440,7 +340,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	nonce := result.Nonce
 	redirectURL := lifecycle.BuildLoginRedirectURL(shop, a.cfg.AppID, nonce, a.cfg.BaseURL+"/auth/callback")
 
-	slog.Info("login initiated", "shop", shop, "challenge", result.ChallengeID, "nonce", nonce[:8]+"...")
+	slog.Info("login initiated", "shop", shop, "insales_id", insalesID)
 
 	http.Redirect(w, r, redirectURL, http.StatusFound) // #nosec G710 -- host совпадает с shop установленного магазина
 }
@@ -508,7 +408,7 @@ func (a *App) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// Set session cookie
 	a.setSessionCookie(w, result.SessionID)
 
-	slog.Info("user logged in", "store", result.StoreID, "user", result.UserID)
+	slog.Info("user logged in", "store", result.StoreID)
 
 	// Redirect to dashboard
 	http.Redirect(w, r, "/", http.StatusFound)
@@ -650,18 +550,23 @@ func (a *App) handleUninstall(w http.ResponseWriter, r *http.Request) {
 		insalesID = id
 	}
 
-	err := a.lifecycle.HandleUninstall(r.Context(), lifecycle.UninstallParams{
-		Shop:      shop,
+	shopHost, err := insales.CanonicalShop(shop)
+	if err != nil {
+		writeError(w, a.tmpls, "Неверный адрес магазина", http.StatusBadRequest)
+		return
+	}
+
+	err = a.lifecycle.HandleUninstall(r.Context(), lifecycle.UninstallParams{
+		Shop:      shopHost,
 		Token:     token,
 		InsalesID: insalesID,
 	})
-	if err != nil && err != lifecycle.ErrStoreNotInstalled && err != lifecycle.ErrForbidden {
+	if err != nil && !errors.Is(err, lifecycle.ErrStoreNotInstalled) && !errors.Is(err, lifecycle.ErrForbidden) {
 		slog.Error("uninstall error", "shop", shop, "error", err)
-		// Return 500 so InSales will retry the callback
 		writeError(w, a.tmpls, "Ошибка удаления", http.StatusInternalServerError)
 		return
 	}
-	if err == lifecycle.ErrForbidden {
+	if errors.Is(err, lifecycle.ErrForbidden) {
 		slog.Warn("uninstall: wrong password", "shop", shop)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusForbidden)

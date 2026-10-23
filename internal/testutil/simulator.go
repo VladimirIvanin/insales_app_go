@@ -26,6 +26,7 @@ type Response struct {
 	Headers    map[string]string
 	Disconnect bool          // if true, close connection without sending response
 	Wait       chan struct{} // if set, block until signalled (for race testing)
+	Entered    chan struct{} // if set, notified before Wait
 }
 
 // PlatformSimulator simulates the InSales platform for lifecycle testing.
@@ -357,6 +358,12 @@ func (ps *PlatformSimulator) sendResponse(w http.ResponseWriter, resp Response) 
 		return
 	}
 
+	if resp.Entered != nil {
+		select {
+		case resp.Entered <- struct{}{}:
+		default:
+		}
+	}
 	if resp.Wait != nil {
 		<-resp.Wait
 	}

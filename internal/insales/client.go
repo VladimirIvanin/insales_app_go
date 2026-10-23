@@ -1,30 +1,32 @@
 package insales
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
-	"strings"
+	"sync"
 	"time"
 )
 
+const maxResponseBytes = 1 << 20
+
 // Common errors.
 type (
-	// TransportError represents a network-level failure (timeout, DNS, connection refused, etc.).
+	// TransportError represents a network-level failure.
 	TransportError struct{ Err error }
 
 	// APIError represents an unexpected HTTP status from the InSales API.
 	APIError struct {
 		Status     int
 		Body       string
-		RetryAfter int // seconds, from Retry-After header
+		RetryAfter int
 	}
 
-	// ResourceError represents a malformed response (invalid JSON, wrong shape).
+	// ResourceError represents a malformed response.
 	ResourceError struct{ Err error }
 )
 
@@ -42,202 +44,121 @@ func (e *APIError) Error() string {
 func (e *ResourceError) Error() string { return "resource: " + e.Err.Error() }
 func (e *ResourceError) Unwrap() error { return e.Err }
 
-// Account represents a minimal InSales shop account.
-type Account struct {
-	ID    int    `json:"id"`
-	Title string `json:"title"`
+// IsTemporary reports timeout, network, HTTP 429 and 5xx failures.
+func IsTemporary(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Status == http.StatusTooManyRequests || apiErr.Status >= 500
+	}
+	var transportErr *TransportError
+	return errors.As(err, &transportErr)
 }
 
-// Client is an HTTP client for the InSales API bound to a single shop.
+// Client is an HTTP client for one InSales shop.
 type Client struct {
 	baseURL    string
 	appID      string
 	password   string
 	httpClient *http.Client
+
+	mu    sync.Mutex
+	usage string
 }
 
-// NewClient creates a new InSales API client.
-// baseURL must be the shop URL (e.g., "https://shop.myinsales.ru").
-// appID is the application public ID.
-// password is the store-specific install password.
+// NewClient creates a shop client that does not follow redirects.
 func NewClient(baseURL, appID, password string) *Client {
 	return &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		appID:      appID,
-		password:   password,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		baseURL:  stringsTrimRight(baseURL),
+		appID:    appID,
+		password: password,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   5 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          10,
+				IdleConnTimeout:       30 * time.Second,
+				TLSHandshakeTimeout:   5 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
+}
+
+// NewStrictClient is the same client used for install checks and authorized calls.
+func NewStrictClient(baseURL, appID, password string) *Client {
+	return NewClient(baseURL, appID, password)
 }
 
 // SetHTTPClient replaces the underlying HTTP client (used in tests).
 func (c *Client) SetHTTPClient(hc *http.Client) { c.httpClient = hc }
 
-// GetAccount retrieves the shop account information.
-// GET /admin/account.json
-func (c *Client) GetAccount(ctx context.Context) (*Account, error) {
-	u := c.baseURL + "/admin/account.json"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+// UsageLimit returns API-Usage-Limit from the most recent response on this client.
+func (c *Client) UsageLimit() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.usage
+}
+
+func (c *Client) setUsage(v string) {
+	c.mu.Lock()
+	c.usage = v
+	c.mu.Unlock()
+}
+
+func (c *Client) do(ctx context.Context, method, path string, payload []byte) ([]byte, error) {
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {
-		return nil, &TransportError{err}
+		return nil, &TransportError{Err: err}
 	}
 	req.SetBasicAuth(c.appID, c.password)
+	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, &TransportError{err}
+		return nil, &TransportError{Err: err}
 	}
 	defer resp.Body.Close()
+	c.setUsage(resp.Header.Get("API-Usage-Limit"))
 
-	// Limit response body to 1MB.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return nil, &TransportError{err}
+		return nil, &TransportError{Err: err}
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		apiErr := &APIError{Status: resp.StatusCode, Body: string(body)}
+	if len(raw) > maxResponseBytes {
+		return nil, &ResourceError{Err: errors.New("response exceeds maximum size")}
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		apiErr := &APIError{Status: resp.StatusCode, Body: string(raw)}
 		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
-			if seconds, err := fmt.Sscanf(retryAfter, "%d", &apiErr.RetryAfter); err == nil && seconds == 1 {
-				// parsed ok
+			if _, scanErr := fmt.Sscanf(retryAfter, "%d", &apiErr.RetryAfter); scanErr != nil {
+				apiErr.RetryAfter = 0
 			}
 		}
 		return nil, apiErr
 	}
-
-	var account Account
-	if err := json.Unmarshal(body, &account); err != nil {
-		return nil, &ResourceError{fmt.Errorf("invalid JSON: %w", err)}
-	}
-	if account.ID == 0 {
-		return nil, &ResourceError{fmt.Errorf("missing account.id in response: %s", string(body))}
-	}
-
-	return &account, nil
+	return raw, nil
 }
 
-// ValidateShopURL checks that the shop URL is valid and allowed.
-// Returns the normalized HTTPS URL or an error.
-// Only trusts the parsed hostname — rejects userinfo, path, fragment, and empty host.
-// An empty allowed list is refused by default — the operator MUST configure
-// at least one allowed domain. This prevents an attacker from pointing their
-// own HTTPS server at the install/login/uninstall endpoints and passing
-// account.id checks with a synthetic InSales-compatible response.
-func ValidateShopURL(shop string, allowed []string) (string, error) {
-	if shop == "" {
-		return "", fmt.Errorf("shop is empty")
+func stringsTrimRight(baseURL string) string {
+	for len(baseURL) > 0 && baseURL[len(baseURL)-1] == '/' {
+		baseURL = baseURL[:len(baseURL)-1]
 	}
-
-	// Add scheme if missing for proper parsing
-	input := shop
-	if !strings.Contains(input, "://") {
-		input = "https://" + input
-	}
-
-	u, err := url.Parse(input)
-	if err != nil {
-		return "", fmt.Errorf("invalid shop URL: %w", err)
-	}
-
-	// Reject userinfo, path, fragment, query
-	if u.User != nil {
-		return "", fmt.Errorf("shop URL contains userinfo")
-	}
-	if u.Path != "" && u.Path != "/" {
-		return "", fmt.Errorf("shop URL contains path")
-	}
-	if u.Fragment != "" {
-		return "", fmt.Errorf("shop URL contains fragment")
-	}
-	if u.RawQuery != "" {
-		return "", fmt.Errorf("shop URL contains query")
-	}
-
-	hostname := u.Hostname()
-	if hostname == "" {
-		return "", fmt.Errorf("invalid shop URL: empty host")
-	}
-
-	// Reject IP addresses (must be a domain)
-	if net.ParseIP(hostname) != nil {
-		return "", fmt.Errorf("shop URL is an IP address, domain required")
-	}
-
-	// Must have at least one dot (domain)
-	if !strings.Contains(hostname, ".") {
-		return "", fmt.Errorf("shop %q is not a valid domain", hostname)
-	}
-
-	// Check allowed shops list — MUST be non-empty, no wildcard.
-	if len(allowed) == 0 {
-		return "", fmt.Errorf("ALLOWED_SHOPS is empty: at least one shop domain must be configured (security)")
-	}
-	matched := false
-	for _, a := range allowed {
-		if hostname == a || strings.HasSuffix(hostname, "."+a) {
-			matched = true
-			break
-		}
-	}
-	if !matched {
-		return "", fmt.Errorf("shop %q is not in the allowed list", hostname)
-	}
-
-	return "https://" + hostname, nil
-}
-
-// IsTransientError returns true if the error is transient and the operation should be retried.
-func IsTransientError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var apiErr *APIError
-	if asError(err, &apiErr) {
-		return apiErr.Status >= 429 || apiErr.Status >= 500
-	}
-	var transportErr *TransportError
-	if asError(err, &transportErr) {
-		return true
-	}
-	return false
-}
-
-// asError is a generic errors.As helper for Go 1.23 compatibility.
-func asError[T error](err error, target *T) bool {
-	for {
-		if e, ok := err.(T); ok {
-			*target = e
-			return true
-		}
-		if u, ok := err.(interface{ Unwrap() error }); ok {
-			err = u.Unwrap()
-		} else {
-			return false
-		}
-	}
-}
-
-// ensureNoRedirect is a CheckRedirect policy that rejects all redirects.
-func ensureNoRedirect(_ *http.Request, _ []*http.Request) error {
-	return http.ErrUseLastResponse
-}
-
-// NewStrictClient creates a client with redirects disabled and strict timeouts.
-func NewStrictClient(baseURL, appID, password string) *Client {
-	c := NewClient(baseURL, appID, password)
-	c.httpClient = &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   5 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          10,
-			IdleConnTimeout:       30 * time.Second,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-		CheckRedirect: ensureNoRedirect,
-	}
-	return c
+	return baseURL
 }

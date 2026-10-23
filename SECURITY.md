@@ -54,16 +54,15 @@ This project implements the following security measures:
     - `PRAGMA foreign_keys = ON` is set on the connection, not per-transaction.
 
 12. **Lifecycle Safety**:
-    - Candidate generation is reserved atomically within a transaction.
-    - Background verification worker runs periodic polls (every 30s) and processes on-demand signals, ensuring candidates whose `next_attempt_at` has elapsed are retried even without new install events.
-    - Expired sessions and challenges are cleaned up every 5 minutes by the background worker.
-    - `ClaimCandidate` uses exponential backoff (10s, 30s, 90s) and unique lease tokens.
-    - Transient API errors (429, 5xx, transport) are recorded with `Retry-After` header value and re-scheduled.
-    - Uninstall with a database error returns HTTP 500 so InSales retries the callback.
-    - Uninstall verifies credentials inside a single write-transaction (TOCTOU prevention). Full store deletion only happens when the active store credential matches; a matching candidate password removes only that candidate.
-    - Session creation and verification include `installation_epoch`, a monotonic counter that increments on every reinstall. This prevents a session captured during a previous installation from being reused after uninstall+reinstall.
-    - Per-store candidate limit (max 5) and global candidate limit (max 100) prevent backlog exhaustion.
-    - Expired challenge cleanup is committed to the database (not rolled back).
+    - The installation generation is reserved in the same write transaction as the candidate and is not reset on uninstall.
+    - `/install` only stores a candidate. `account.json` is checked on the next `/login`, with a five-second limit and without a background queue.
+    - A temporary API error keeps the candidate. The user retries by opening the app again.
+    - Activation re-reads the candidate and does not restore a row that was removed during the request.
+    - A database error on uninstall returns HTTP 500 so InSales retries the callback.
+    - Uninstall checks the credential in one transaction. A matching active connection removes that connection and pending rows with the same password. A matching pending password does not remove an active connection that has a different password.
+    - Challenges and sessions are inserted only for the generation that is still current. An old login cannot read credentials of a newer installation.
+    - At most five pending installs are kept per shop domain, for seven days.
+    - Expired challenges and sessions are deleted when a new one is created. TTL is checked on every read.
 
 ## Scope
 

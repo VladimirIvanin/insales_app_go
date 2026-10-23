@@ -45,15 +45,19 @@ func newTestDB(t *testing.T) *storage.DB {
 
 // testConfig returns a minimal config suitable for testing.
 func testConfig() *config.Config {
+	allowed := []string{"test-shop.myinsales.ru", "ghost-shop.myinsales.ru"}
+	for i := 1; i <= 60; i++ {
+		allowed = append(allowed, fmt.Sprintf("shop-%d.myinsales.ru", i))
+	}
 	return &config.Config{
 		AppID:         "test-app-id",
 		AppSecret:     "test-app-secret",
 		BaseURL:       "http://localhost:9999",
-		AllowedShops:  []string{"myinsales.ru"}, // tests use subdomains under this
+		AllowedShops:  allowed,
 		DBPath:        ":memory:",
 		BindHost:      "127.0.0.1",
 		Port:          0,
-		EncryptionKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 32 bytes hex
+		EncryptionKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		LogLevel:      "debug",
 	}
 }
@@ -162,20 +166,17 @@ func installStore(t *testing.T, fx *testFixture, srv *httptest.Server, shop stri
 		t.Fatalf("install status = %d, want %d", statusCode, http.StatusOK)
 	}
 
-	// Wait for background verification worker to process the candidate.
-	// The worker polls with exponential backoff. We poll storage directly.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		_, err := fx.DB.GetActiveStore(storeID)
-		if err == nil {
-			// Store is active — promotion succeeded
-			return password
-		}
-		time.Sleep(50 * time.Millisecond)
+	loginURL := fmt.Sprintf("%s/login?shop=%s&insales_id=%d&user_id=test-user", srv.URL, url.QueryEscape(shop), storeID)
+	loginResp, err := noRedirectClient().Get(loginURL) //nolint:noctx
+	if err != nil {
+		t.Fatalf("login: %v", err)
 	}
-
-	t.Fatal("timed out waiting for store to become active")
-	return ""
+	defer loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(loginResp.Body)
+		t.Fatalf("login status = %d, body = %s", loginResp.StatusCode, body)
+	}
+	return password
 }
 
 // loginAndGetSession performs the login flow and returns a session cookie.
@@ -307,8 +308,7 @@ func sharedTestShop(storeID int) string {
 	return fmt.Sprintf("shop-%d.myinsales.ru", storeID)
 }
 
-// TestInstallFullFlow tests the complete install flow:
-// install -> background worker promotes -> store becomes active.
+// TestInstallFullFlow installs a shop and activates it on the first login.
 func TestInstallFullFlow(t *testing.T) {
 	fx, srv := newFixture(t)
 
@@ -339,33 +339,27 @@ func TestInstallFullFlow(t *testing.T) {
 	}
 }
 
-// TestUninstallWhilePending tests that uninstall between API response
-// and PromoteCandidate leaves stores empty.
+// TestUninstallWhilePending checks that a late account.json response
+// does not restore a candidate removed during the request.
 func TestUninstallWhilePending(t *testing.T) {
 	fx, srv := newFixture(t)
 
 	shop := sharedTestShop(42)
 	storeID := 42
-
-	// Configure store but DON'T have the simulator verify yet
 	fx.Sim.SetAccount(storeID, "Test Shop")
 
-	// Gate the API call so we can uninstall while verification is blocked.
-	// Set RespondNext BEFORE install so the worker hits it.
+	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-
 	token := "install-token-1"
 	password := fx.Sim.InstallPassword(token)
-
 	fx.Sim.ConfigureStore(storeID, password)
-
 	fx.Sim.RespondNext("GET", "/admin/account.json", testutil.Response{
-		Status: 200,
-		Body:   `{"id":42,"title":"Test Shop"}`,
-		Wait:   release,
+		Status:  200,
+		Body:    `{"id":42,"title":"Test Shop"}`,
+		Wait:    release,
+		Entered: entered,
 	})
 
-	// Install — creates candidate
 	installURL := srv.URL + "/install"
 	statusCode, err := fx.Sim.Install(installURL, shop, token)
 	if err != nil {
@@ -374,54 +368,48 @@ func TestUninstallWhilePending(t *testing.T) {
 	if statusCode != http.StatusOK {
 		t.Fatalf("install status = %d", statusCode)
 	}
-
-	// Wait for the background worker to claim and block on the API call
-	// by polling the candidate table.
-	claimed := func() bool {
-		var count int
-		fx.DB.DB().QueryRow("SELECT COUNT(*) FROM candidates WHERE attempts > 0 AND last_error = ''").Scan(&count)
-		return count > 0
+	if _, err := fx.DB.GetActiveStore(storeID); err != storage.ErrNotFound {
+		t.Fatalf("install activated the store: %v", err)
 	}
-	for i := 0; i < 100; i++ {
-		if claimed() {
-			break
+
+	loginErr := make(chan error, 1)
+	go func() {
+		loginURL := srv.URL + "/login?shop=" + shop + "&insales_id=42&user_id=test-user"
+		resp, err := noRedirectClient().Get(loginURL) //nolint:noctx
+		if err != nil {
+			loginErr <- err
+			return
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !claimed() {
-		t.Fatal("candidate was not claimed by background worker")
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusNotFound {
+			loginErr <- fmt.Errorf("login status = %d, body %s", resp.StatusCode, body)
+			return
+		}
+		loginErr <- nil
+	}()
+
+	select {
+	case <-entered:
+	case err := <-loginErr:
+		t.Fatalf("login finished before the API call: %v", err)
 	}
 
-	// Uninstall while verification is blocked at the API call
-	uninstallURL := srv.URL + "/uninstall"
-	uStatus, uErr := fx.Sim.Uninstall(uninstallURL, shop, password)
+	uStatus, uErr := fx.Sim.Uninstall(srv.URL+"/uninstall", shop, password)
 	if uErr != nil {
 		t.Fatalf("Sim.Uninstall: %v", uErr)
 	}
 	if uStatus != http.StatusOK {
-		t.Fatalf("uninstall status = %d, want %d", uStatus, http.StatusOK)
+		t.Fatalf("uninstall status = %d", uStatus)
 	}
-
-	// Verify store is gone
-	_, err = fx.DB.GetActiveStore(storeID)
-	if err != storage.ErrNotFound {
-		t.Fatalf("expected store to be removed, got err = %v", err)
-	}
-
-	// Release the blocked API call
 	close(release)
 
-	// Give the worker time to finish PromoteCandidate and detect
-	// the candidate was cancelled/removed by the preceding uninstall.
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify no store appeared after late API response
-	_, err = fx.DB.GetActiveStore(storeID)
-	if err != storage.ErrNotFound {
-		t.Fatalf("store should remain gone after late API response, got err = %v", err)
+	if err := <-loginErr; err != nil {
+		t.Fatal(err)
 	}
-
-	t.Log("uninstall while verification pending: OK")
+	if _, err := fx.DB.GetActiveStore(storeID); err != storage.ErrNotFound {
+		t.Fatalf("store restored after late response: %v", err)
+	}
 }
 
 // TestTwoStoresIsolation tests that sessions from different stores are isolated
@@ -458,14 +446,14 @@ func TestTwoStoresIsolation(t *testing.T) {
 		t.Fatalf("install store2 status = %d", respInstall2.StatusCode)
 	}
 
-	// Wait for store 2 to become active
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		_, err := fx.DB.GetActiveStore(43)
-		if err == nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	loginURL2 := fmt.Sprintf("%s/login?shop=%s&insales_id=43&user_id=test-user", srv.URL, shop2)
+	loginResp2, err := noRedirectClient().Get(loginURL2) //nolint:noctx
+	if err != nil {
+		t.Fatalf("login store2: %v", err)
+	}
+	loginResp2.Body.Close()
+	if loginResp2.StatusCode != http.StatusFound {
+		t.Fatalf("login store2 status = %d", loginResp2.StatusCode)
 	}
 
 	// Verify both stores exist
@@ -698,24 +686,23 @@ func TestRepeatedCallback(t *testing.T) {
 		t.Fatalf("second install status = %d, want %d", statusCode, http.StatusOK)
 	}
 
-	// Wait for second verification
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		store, err := fx.DB.GetActiveStore(storeID)
-		if err != nil {
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		if store.Generation >= 2 {
-			// Second install promoted
-			_ = password1
-			_ = password2
-			return // success
-		}
-		time.Sleep(50 * time.Millisecond)
+	loginURL := fmt.Sprintf("%s/login?shop=%s&insales_id=%d&user_id=test-user", srv.URL, shop, storeID)
+	loginResp, err := noRedirectClient().Get(loginURL) //nolint:noctx
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	t.Fatal("timed out waiting for second install to process")
+	loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusFound {
+		t.Fatalf("second login status = %d", loginResp.StatusCode)
+	}
+	store, err := fx.DB.GetActiveStore(storeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Password != password2 {
+		t.Fatal("second install was not activated")
+	}
+	_ = password1
 }
 
 // TestUnknownPath tests that an unknown path returns 404.
@@ -930,19 +917,14 @@ func TestMultipleInstallSameStore(t *testing.T) {
 		if statusCode != http.StatusOK {
 			t.Fatalf("install iteration %d status = %d", i, statusCode)
 		}
-
-		// Wait for verification
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			store, err := fx.DB.GetActiveStore(storeID)
-			if err != nil {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			if store.Generation >= int64(i+1) {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
+		loginURL := fmt.Sprintf("%s/login?shop=%s&insales_id=%d&user_id=test-user", srv.URL, shop, storeID)
+		loginResp, err := noRedirectClient().Get(loginURL) //nolint:noctx
+		if err != nil {
+			t.Fatalf("login iteration %d: %v", i, err)
+		}
+		loginResp.Body.Close()
+		if loginResp.StatusCode != http.StatusFound {
+			t.Fatalf("login iteration %d status = %d", i, loginResp.StatusCode)
 		}
 	}
 

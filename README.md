@@ -3,176 +3,162 @@
 [![CI](https://github.com/ivaninvladimir/insales_app_go/actions/workflows/ci.yml/badge.svg)](https://github.com/ivaninvladimir/insales_app_go/actions/workflows/ci.yml)
 [![Security Audit](https://github.com/ivaninvladimir/insales_app_go/actions/workflows/security.yml/badge.svg)](https://github.com/ivaninvladimir/insales_app_go/actions/workflows/security.yml)
 
-Устанавливаемое партнёрское приложение для платформы [InSales](https://www.insales.ru) на Go.
+Заготовка устанавливаемого партнёрского приложения для платформы [InSales](https://www.insales.ru) на Go.
 
-Первая версия реализует:
-- установка, переустановка и удаление приложения;
-- вход сотрудника магазина через InSales (token3);
-- поддержка нескольких магазинов с изоляцией данных;
-- минимальный HTTP-клиент InSales API (GET /admin/account.json);
-- постоянное хранилище подключений и серверных сессий (SQLite);
-- шифрование паролей магазинов (AES-256-GCM);
-- автоматические тесты и GitHub Actions (CI + security audit);
-- фоновый Lifecycle с обработкой конкурентных установок.
+Один законченный путь: сохранить установку, открыть приложение через token3, вызвать API магазина и удалить подключение. Пароли магазинов шифруются AES-256-GCM.
 
-## Быстрый старт
+Проверка подключения выполняется при первом открытии, а не сразу после install. Фоновых worker и очередей нет.
 
-### Требования
+## Требования
 
 - Go 1.27.3+
-- SQLite (pure-Go через `modernc.org/sqlite`, CGO не требуется)
+- SQLite через `modernc.org/sqlite` (CGO не нужен)
 
-### Установка и запуск
+## Запуск
 
 ```bash
-# Клонировать репозиторий
 git clone https://github.com/ivaninvladimir/insales_app_go.git
 cd insales_app_go
-
-# Скопировать и настроить переменные окружения
 cp .env.example .env
-# Отредактировать .env со своими значениями
-# Загрузить переменные в окружение (код использует os.Getenv)
-export $(grep -v '^\s*#' .env | xargs)
-
-# Запустить тесты
-go test -race -coverprofile=coverage.out ./...
-
-# Собрать
 go build -o bin/server ./cmd/server
-
-# Запустить
+./bin/server db upgrade
 ./bin/server
 ```
 
-### Переменные окружения
-
-| Переменная | Обязательная | Описание |
-|---|---|---|
-| `INSALES_APP_ID` | Да | Публичный идентификатор приложения |
-| `INSALES_APP_SECRET` | Да | Секретный ключ приложения |
-| `APP_BASE_URL` | Да | Публичный URL приложения (для callback) |
-| `ALLOWED_SHOPS` | Да | Список разрешённых доменов магазинов через запятую. **Обязателен.** Пустое значение = отказ всем доменам. |
-| `APP_DB` | Нет | Путь к файлу SQLite (по умолчанию `runtime/app.sqlite3`) |
-| `BIND_HOST` | Нет | Адрес для привязки сервера (по умолчанию `127.0.0.1`) |
-| `PORT` | Нет | Порт сервера (по умолчанию `8765`) |
-| `ENCRYPTION_KEY` | Да | 32 байта hex для AES-256: `openssl rand -hex 32` |
-| `LOG_LEVEL` | Нет | Уровень логирования: debug, info, warn, error |
-
-### Генерация ключа шифрования
+Запуск без аргументов эквивалентен `./bin/server serve`. Уже экспортированные переменные окружения важнее значений из `.env`.
 
 ```bash
-openssl rand -hex 32
+./bin/server db status
+./bin/server doctor
 ```
 
-## Создание приложения в InSales
+`doctor` проверяет настройки, схему и API уже активных подключений. Он не активирует непроверенные установки.
 
-1. В панели управления InSales перейдите в **Приложения → Партнёрские приложения → Создать приложение**.
+## Регистрация приложения
+
+1. В InSales откройте **Приложения → Партнёрские приложения → Создать приложение**.
 2. Укажите:
-   - **Название**: любое
-   - **URL установки**: `https://your-domain.com/install`
-   - **URL входа**: `https://your-domain.com/login`
-   - **URL удаления**: `https://your-domain.com/uninstall`
-   - **Callback URL**: `https://your-domain.com/auth/callback`
-3. После создания приложения запишите **App ID** и **App Secret**.
-4. Минимальные права: достаточно права на чтение (`read`) для проверки `/admin/account.json`.
+   - URL установки: `https://your-domain.com/install`
+   - URL входа: `https://your-domain.com/login`
+   - URL удаления: `https://your-domain.com/uninstall`
+3. Запишите App ID и App Secret в `.env`.
+4. Добавьте домен магазина в `ALLOWED_SHOPS`. Совпадение точное, после нормализации регистра.
+5. Для проверки установки достаточно права на чтение аккаунта. Заказы и товары в примерах клиента требуют соответствующих прав.
+
+Callback входа приложение формирует само при переходе в магазин: `APP_BASE_URL/auth/callback`.
+
+## Жизненный цикл
+
+### Install
+
+`GET /install` проверяет параметры и allowlist, вычисляет пароль `MD5(token + app_secret)` и сохраняет кандидата. Ответ `200` не означает, что подключение уже проверено: запросов к API на этом шаге нет.
+
+Повтор того же пароля не создаёт вторую запись и не сбрасывает сессии. На один домен хранится не больше пяти кандидатов, каждый не дольше семи дней.
+
+### Первый вход
+
+`GET /login` выбирает самый новый кандидат, который новее активного подключения, и делает один запрос `account.json` не дольше пяти секунд.
+
+- Совпавший `account.id` активирует именно этот кандидат, затем начинается вход через token3.
+- Таймаут, обрыв сети, `429` и `5xx` оставляют кандидата. Если активного подключения нет, нужно повторить вход. Если оно есть, вход продолжается по нему.
+- `401`, `403`, другая окончательная ошибка API и чужой `account.id` удаляют выбранного кандидата.
+- Неразборчивый ответ не удаляет кандидата: это не доказательство неверного пароля.
+
+До проверки token3 сессия не создаётся.
+
+### Повторный вход
+
+Если нового кандидата нет, повторный вход не проверяет установку через API. Одноразовый challenge привязан к браузеру и поколению подключения. InSales возвращает token3, приложение открывает серверную сессию.
+
+Pending и active переживают перезапуск процесса.
+
+### Uninstall
+
+`GET /uninstall` в одной транзакции сверяет `insales_id`, домен и пароль подключения.
+
+- Совпал active: удаляются это подключение, его сессии, challenge и pending с тем же паролем.
+- Совпал только pending: удаляются эти кандидаты, active с другим паролем остаётся.
+- Уже удалённое подключение подтверждается повторно. Неверный пароль существующего подключения отклоняется. Ошибка базы не превращается в успешный ответ.
+
+## API-примеры
+
+Один клиент обслуживает проверку установки, маршруты приложения и тесты. Редиректы не следуют, размер ответа ограничен, ошибки сети, HTTP и формата различаются.
+
+```go
+account, err := client.GetAccount(ctx)
+orders, err := client.ListOrders(ctx, 1, 50)
+order, err := client.GetOrder(ctx, 123)
+count, err := client.CountOrders(ctx)
+updated, err := client.UpdateOrder(ctx, 123, map[string]any{"status": "cancelled"})
+
+product, err := client.GetProduct(ctx, 456)
+products, err := client.ListProducts(ctx, 1, 50)
+n, err := client.CountProducts(ctx)
+renamed, err := client.UpdateProduct(ctx, 456, map[string]any{"title": "Cup"})
+usage := client.UsageLimit()
+```
+
+Автоматических повторов запросов нет. `UsageLimit` показывает `API-Usage-Limit` последнего ответа этого клиента.
 
 ## Маршруты
 
-| Маршрут | Метод | Назначение |
+| Метод | Путь | Назначение |
 |---|---|---|
-| `GET /install` | GET | Приём установки от InSales |
-| `GET /login` | GET | Начало входа через InSales |
-| `GET /auth/callback` | GET | Проверка ответа InSales (token3) |
-| `GET /` | GET | Страница приложения (требуется сессия) |
-| `POST /probe` | POST | Проверочный запрос к API магазина |
-| `POST /logout` | POST | Завершение сессии |
-| `GET /uninstall` | GET | Удаление подключения |
-| `GET /healthz` | GET | Проверка работоспособности |
+| GET | `/install` | Принять установку |
+| GET | `/login` | Проверить кандидата и начать token3 |
+| GET | `/auth/callback` | Проверить token3 и открыть сессию |
+| GET | `/` | Страница приложения |
+| POST | `/probe` | Проверочный запрос `account.json` |
+| POST | `/logout` | Завершить сессию |
+| GET | `/uninstall` | Отменить подключение |
+| GET | `/healthz` | Проверка процесса |
 
-## Архитектура
+## Настройки
 
-```
-cmd/server/           # Точка входа, DI-фабрика, graceful shutdown
-internal/
-  config/             # Загрузка конфигурации из переменных окружения
-  insales/
-    protocol.go       # Формулы MD5 (password, token, token2, token3)
-    client.go         # HTTP-клиент InSales API (GetAccount)
-  storage/            # SQLite-хранилище с inline-миграциями
-  lifecycle/          # Сценарии install, login, autologin, uninstall
-  httpapp/
-    templates/        # HTML-шаблоны (dashboard, error, install_ok) — embedded
-  testutil/           # Симулятор платформы для тестов
-.github/workflows/    # CI и Security workflow
-```
+| Переменная | Обязательная | Описание |
+|---|---|---|
+| `INSALES_APP_ID` | Да | Идентификатор приложения |
+| `INSALES_APP_SECRET` | Да | Секрет приложения |
+| `APP_BASE_URL` | Да | Публичный URL приложения |
+| `ALLOWED_SHOPS` | Да | Домены магазинов через запятую, точное совпадение |
+| `ENCRYPTION_KEY` | Да | 32 байта hex: `openssl rand -hex 32` |
+| `APP_DB` | Нет | Файл SQLite, по умолчанию `runtime/app.sqlite3` |
+| `BIND_HOST` | Нет | По умолчанию `127.0.0.1` |
+| `PORT` | Нет | По умолчанию `8765` |
+| `LOG_LEVEL` | Нет | `debug`, `info`, `warn`, `error` |
 
-## Тестирование
+Credentials и query-параметры авторизации в логи не пишутся.
 
-### Автономные тесты (без внешних зависимостей)
+## Тесты
 
 ```bash
 go test -race -coverprofile=coverage.out ./...
+go vet ./...
+go build ./...
 ```
 
-Тесты используют:
-- **test vectors**: фиксированные эталонные значения для password и token3 (cross-language);
-- **httptest**: локальный HTTP-сервер для API-клиента;
-- **временные SQLite**: изолированные БД на каждый тест;
-- **симулятор платформы**: эмуляция InSales install/login/uninstall flow.
+Автономные тесты используют временную SQLite и симулятор платформы. Обновление заказа и товара проверяется на симуляторе и не изменяет магазин.
 
-### Ручная проверка на тестовом магазине
+Отдельная проверка на тестовом магазине: install, первый вход, probe, перезапуск, повторный вход, uninstall, повторная установка. Успех симулятора не доказывает совместимость с платформой.
 
-1. Настройте `.env` с реальными параметрами приложения.
-2. Обеспечьте HTTPS-доступ к приложению (ngrok, reverse proxy).
-3. Установите приложение в тестовый магазин через панель InSales.
-4. Проверьте сценарий: установка → вход → проверка API → удаление.
+## Ограничения
 
-Успех симулятора **не** подтверждает совместимость с реальной платформой.
+- Один web-процесс и один файл SQLite.
+- Фоновых worker и очередей нет. Без активного подключения временная ошибка проверки требует нового входа.
+- Непроверенный кандидат не даёт сессию и не заменяет действующее подключение.
+- Webhooks, подписки, OAuth/OIDC покупателей и многопроцессный запуск не входят в заготовку.
 
-## Проверенные сценарии
+## Структура
 
-- Установка с верификацией через API
-- Отклонение установки при несовпадении account.id
-- Отклонение установки для незарегистрированного магазина
-- Переустановка с увеличением поколения
-- Установка → вход → проверка API → удаление (полный lifecycle)
-- Удаление с неверным паролем (отклоняется)
-- Удаление с верным паролем (удаляет магазин, сессии, challenges)
-- Идемпотентность повторного удаления
-- Истечение срока сессии
-- Изоляция сессий разных магазинов
-- Consumption of one-time challenge
-- Привязка challenge к браузеру
-
-## Ограничения первой версии
-
-- **Один процесс**: всё приложение работает в одном процессе. Для горизонтального масштабирования требуется отдельная очередь заданий.
-- **SQLite**: хранение в одном SQLite-файле. Для production-нагрузок рекомендуется PostgreSQL или другая СУБД.
-- **Очередь**: фоновые проверки установки выполняются через внутренний канал и горутину. Нет внешней очереди (Redis, RabbitMQ).
-- **Вебхуки, подписки, OAuth/OIDC покупателей, SPA** не реализованы.
-
-## Расширение
-
-### Добавление API-метода
-
-```go
-// internal/insales/client.go
-func (c *Client) GetOrders(ctx context.Context) ([]Order, error) {
-    // ...
-}
 ```
-
-### Добавление страницы
-
-1. Создайте шаблон в `internal/httpapp/templates/` (используется `go:embed templateFS`).
-2. Добавьте маршрут в `internal/httpapp/httpapp.go`.
-3. Пересоберите бинарник: `go build -o bin/server ./cmd/server`.
-
-## Зависимости
-
-- Стандартная библиотека Go (net/http, html/template, database/sql, crypto/*, log/slog)
-- `modernc.org/sqlite` — pure-Go SQLite (без CGO)
+cmd/server/                 # serve, db upgrade, db status, doctor
+internal/config/            # окружение и .env
+internal/insales/           # протокол, транспорт, account, orders, products
+internal/storage/           # SQLite и миграции
+internal/lifecycle/         # install, login, uninstall
+internal/httpapp/templates/ # единственный каталог шаблонов
+internal/testutil/          # симулятор платформы
+```
 
 ## Лицензия
 

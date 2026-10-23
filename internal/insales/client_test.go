@@ -224,14 +224,14 @@ func TestValidateShopURL(t *testing.T) {
 		want    string
 		err     bool
 	}{
-		{"shop.myinsales.ru", []string{"myinsales.ru"}, "https://shop.myinsales.ru", false},
-		{"https://shop.myinsales.ru", []string{"myinsales.ru"}, "https://shop.myinsales.ru", false},
-		{"http://shop.myinsales.ru", []string{"myinsales.ru"}, "https://shop.myinsales.ru", false},
-		{"", []string{"myinsales.ru"}, "", true},
-		{"shop.myinsales.ru", nil, "", true}, // empty allowlist = refused
-		{"unknown.com", []string{"myinsales.ru"}, "", true},
 		{"shop.myinsales.ru", []string{"shop.myinsales.ru"}, "https://shop.myinsales.ru", false},
-		{"sub.shop.myinsales.ru", []string{"myinsales.ru"}, "https://sub.shop.myinsales.ru", false},
+		{"https://shop.myinsales.ru", []string{"shop.myinsales.ru"}, "https://shop.myinsales.ru", false},
+		{"http://Shop.Myinsales.ru", []string{"shop.myinsales.ru"}, "https://shop.myinsales.ru", false},
+		{"", []string{"shop.myinsales.ru"}, "", true},
+		{"shop.myinsales.ru", nil, "", true},
+		{"unknown.com", []string{"shop.myinsales.ru"}, "", true},
+		{"sub.shop.myinsales.ru", []string{"shop.myinsales.ru"}, "", true},
+		{"shop.myinsales.ru", []string{"myinsales.ru"}, "", true},
 	}
 
 	for _, tt := range tests {

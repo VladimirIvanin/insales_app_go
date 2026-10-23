@@ -2,8 +2,7 @@ package storage_test
 
 import (
 	"crypto/rand"
-	"encoding/hex"
-	"os"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,510 +12,450 @@ import (
 
 func newTestDB(t *testing.T) *storage.DB {
 	t.Helper()
-
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)
 	}
-
-	db, err := storage.New(dbPath, key)
+	db, err := storage.New(filepath.Join(dir, "test.db"), key)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-
 	return db
 }
 
-func TestMigrations(t *testing.T) {
+func TestFreshSchema(t *testing.T) {
 	db := newTestDB(t)
-
-	// Verify tables exist
-	var count int
-	err := db.DB().QueryRow("SELECT COUNT(*) FROM stores").Scan(&count)
+	applied, err := db.AppliedVersions()
 	if err != nil {
-		t.Fatalf("stores table not accessible: %v", err)
+		t.Fatal(err)
 	}
-	err = db.DB().QueryRow("SELECT COUNT(*) FROM schema_version WHERE version = 1").Scan(&count)
-	if err != nil {
-		t.Fatalf("schema_version not accessible: %v", err)
+	if len(applied) != len(storage.Migrations) {
+		t.Fatalf("versions = %v", applied)
 	}
-	if count != 1 {
-		t.Fatalf("expected 1 migration, got %d", count)
+	var name string
+	err = db.DB().QueryRow(`SELECT name FROM pragma_table_info('candidates') WHERE name = 'attempts'`).Scan(&name)
+	if err != sql.ErrNoRows {
+		t.Fatalf("queue column attempts still present: %v %q", err, name)
+	}
+	if _, err := db.GenerationValue(); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestMigrationsIdempotent(t *testing.T) {
-	// Open DB twice - second open should not error
-	db := newTestDB(t)
-	db.Close()
-
-	// Reopen same DB
-	dir := filepath.Dir(os.TempDir()) // we don't have the path, let's use a temp approach
-	_ = dir
-
-	// Actually just verify the first one worked
-	_ = db
-}
-
-func TestCandidateLifecycle(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now()
-	frozen := now
-	db.SetClock(func() time.Time { return frozen })
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     42,
-		Shop:        "test-shop.myinsales.ru",
-		Password:    "plain-password",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	if err := db.CreateCandidate(c); err != nil {
-		t.Fatalf("CreateCandidate: %v", err)
-	}
-
-	// Claim
-	claimed, err := db.ClaimCandidate()
-	if err != nil {
-		t.Fatalf("ClaimCandidate: %v", err)
-	}
-	if claimed == nil {
-		t.Fatal("expected candidate, got nil")
-	}
-	if claimed.Shop != "test-shop.myinsales.ru" {
-		t.Errorf("shop = %q, want %q", claimed.Shop, "test-shop.myinsales.ru")
-	}
-	if claimed.Password != "plain-password" {
-		t.Errorf("password = %q, want %q", claimed.Password, "plain-password")
-	}
-
-	// Promote
-	promoted, err := db.PromoteCandidate("cand-1", "Test Shop")
-	if err != nil {
-		t.Fatalf("PromoteCandidate: %v", err)
-	}
-	if !promoted {
-		t.Fatal("expected promotion to succeed")
-	}
-
-	// Verify store exists
-	store, err := db.GetActiveStore(42)
-	if err != nil {
-		t.Fatalf("GetActiveStore: %v", err)
-	}
-	if store.Title != "Test Shop" {
-		t.Errorf("title = %q, want %q", store.Title, "Test Shop")
-	}
-	if store.Password != "plain-password" {
-		t.Errorf("password = %q, want %q", store.Password, "plain-password")
-	}
-}
-
-func TestStorePersistenceAcrossReopen(t *testing.T) {
+func TestReopen(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "persist.db")
+	path := filepath.Join(dir, "test.db")
+	key := bytes32(t)
+	db, err := storage.New(path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveInstall("c1", 7, "shop.example.test", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = storage.New(path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	n, err := db.CountCandidates("shop.example.test")
+	if err != nil || n != 1 {
+		t.Fatalf("candidates = %d, err %v", n, err)
+	}
+}
 
+func TestInstallLimitDedupAndTTL(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	db.SetClock(func() time.Time { return now })
+
+	first, err := db.SaveInstall("c1", 1, "shop.example.test", "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := db.SaveInstall("c2", 99, "shop.example.test", "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Created {
+		t.Fatal("same credential must not create another candidate")
+	}
+	if again.CandidateID != first.CandidateID || again.Generation != first.Generation {
+		t.Fatalf("dedup changed identity: %+v vs %+v", again, first)
+	}
+
+	for i := 0; i < 6; i++ {
+		id := "extra-" + string(rune('a'+i))
+		if _, err := db.SaveInstall(id, 100+i, "shop.example.test", "pw-"+id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := db.CountCandidates("shop.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != storage.MaxCandidatesPerShop {
+		t.Fatalf("candidates = %d, want %d", n, storage.MaxCandidatesPerShop)
+	}
+
+	oldNow := now
+	now = now.Add(8 * 24 * time.Hour)
+	if _, err := db.SaveInstall("fresh", 1, "shop.example.test", "brand-new"); err != nil {
+		t.Fatal(err)
+	}
+	n, err = db.CountCandidates("shop.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("after ttl candidates = %d, want 1 (clock %s -> %s)", n, oldNow, now)
+	}
+}
+
+func TestActiveCredentialDoesNotResetSession(t *testing.T) {
+	db := newTestDB(t)
+	saved, err := db.SaveInstall("c1", 1, "shop.example.test", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := db.ActivateCandidate(saved.CandidateID, "Shop")
+	if err != nil || !ok {
+		t.Fatalf("activate %v %v", ok, err)
+	}
+	if err := db.CreateSession("sess", 1, "user", saved.Generation, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	repeat, err := db.SaveInstall("c2", 1, "shop.example.test", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeat.Created {
+		t.Fatal("matching active credential created a pending row")
+	}
+	if _, _, err := db.VerifySession("sess"); err != nil {
+		t.Fatalf("session was reset: %v", err)
+	}
+	n, err := db.CountCandidates("shop.example.test")
+	if err != nil || n != 0 {
+		t.Fatalf("pending = %d err %v", n, err)
+	}
+}
+
+func TestUninstallKeepsOtherPending(t *testing.T) {
+	db := newTestDB(t)
+	active, err := db.SaveInstall("active", 1, "shop.example.test", "active-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.ActivateCandidate(active.CandidateID, "Shop"); err != nil || !ok {
+		t.Fatalf("activate %v %v", ok, err)
+	}
+	other, err := db.SaveInstall("other", 1, "shop.example.test", "other-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := db.Uninstall(1, "shop.example.test", "active-pw")
+	if err != nil || !removed {
+		t.Fatalf("uninstall %v %v", removed, err)
+	}
+	if _, err := db.GetActiveStore(1); err != storage.ErrNotFound {
+		t.Fatalf("active still present: %v", err)
+	}
+	pending, err := db.NewestPending(1, "shop.example.test")
+	if err != nil || pending == nil || pending.ID != other.CandidateID {
+		t.Fatalf("other pending = %+v err %v", pending, err)
+	}
+}
+
+func TestUninstallWrongPasswordAndIdempotent(t *testing.T) {
+	db := newTestDB(t)
+	saved, err := db.SaveInstall("c", 1, "shop.example.test", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Uninstall(1, "shop.example.test", "nope"); err != storage.ErrNotAuthorized {
+		t.Fatalf("err = %v", err)
+	}
+	if ok, err := db.ActivateCandidate(saved.CandidateID, "T"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if _, err := db.Uninstall(1, "shop.example.test", "nope"); err != storage.ErrNotAuthorized {
+		t.Fatalf("active wrong password err = %v", err)
+	}
+	if _, err := db.GetActiveStore(1); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := db.Uninstall(1, "shop.example.test", "pw")
+	if err != nil || !removed {
+		t.Fatal(err)
+	}
+	removed, err = db.Uninstall(1, "shop.example.test", "pw")
+	if err != nil || removed {
+		t.Fatalf("second uninstall removed=%v err=%v", removed, err)
+	}
+}
+
+func TestPendingUninstallDoesNotRemoveActive(t *testing.T) {
+	db := newTestDB(t)
+	active, err := db.SaveInstall("a", 1, "shop.example.test", "active-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.ActivateCandidate(active.CandidateID, "T"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveInstall("p", 1, "shop.example.test", "pending-pw"); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := db.Uninstall(1, "shop.example.test", "pending-pw")
+	if err != nil || !removed {
+		t.Fatalf("removed=%v err=%v", removed, err)
+	}
+	store, err := db.GetActiveStore(1)
+	if err != nil || store.Password != "active-pw" {
+		t.Fatalf("store = %+v err %v", store, err)
+	}
+}
+
+func TestActivateDoesNotRestoreRemovedCandidate(t *testing.T) {
+	db := newTestDB(t)
+	saved, err := db.SaveInstall("c", 1, "shop.example.test", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteCandidate(saved.CandidateID); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := db.ActivateCandidate(saved.CandidateID, "T")
+	if err != nil || ok {
+		t.Fatalf("activated=%v err=%v", ok, err)
+	}
+}
+
+func TestStaleCandidateDoesNotReplaceNewerStore(t *testing.T) {
+	db := newTestDB(t)
+	older, err := db.SaveInstall("old", 1, "shop.example.test", "old-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := db.SaveInstall("new", 1, "shop.example.test", "new-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.ActivateCandidate(newer.CandidateID, "New"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	ok, err := db.ActivateCandidate(older.CandidateID, "Old")
+	if err != nil || ok {
+		t.Fatalf("stale activate = %v %v", ok, err)
+	}
+	store, err := db.GetActiveStore(1)
+	if err != nil || store.Password != "new-pw" || store.Generation != newer.Generation {
+		t.Fatalf("store = %+v err %v", store, err)
+	}
+}
+
+func TestChallengeAndSessionBoundToGeneration(t *testing.T) {
+	db := newTestDB(t)
+	saved, err := db.SaveInstall("c", 1, "shop.example.test", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.ActivateCandidate(saved.CandidateID, "T"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	gen, err := db.CreateChallenge("ch", "nonce", "browser", 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen != saved.Generation {
+		t.Fatalf("challenge generation %d", gen)
+	}
+	if _, err := db.ConsumeChallenge("ch", "other"); err != storage.ErrNotAuthorized {
+		t.Fatalf("wrong browser: %v", err)
+	}
+	ch, err := db.ConsumeChallenge("ch", "browser")
+	if err != nil || ch.Nonce != "nonce" {
+		t.Fatalf("consume %+v %v", ch, err)
+	}
+	if _, err := db.ConsumeChallenge("ch", "browser"); err != storage.ErrNotFound {
+		t.Fatalf("second consume %v", err)
+	}
+
+	if err := db.CreateSession("s", 1, "user", saved.Generation, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	next, err := db.SaveInstall("c2", 1, "shop.example.test", "pw2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.ActivateCandidate(next.CandidateID, "T2"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if _, _, err := db.VerifySession("s"); err != storage.ErrNotFound {
+		t.Fatalf("old session err = %v", err)
+	}
+	if err := db.CreateSession("s2", 1, "user", saved.Generation, time.Minute); err != storage.ErrStale {
+		t.Fatalf("old generation session err = %v", err)
+	}
+}
+
+func TestGenerationSurvivesUninstall(t *testing.T) {
+	db := newTestDB(t)
+	first, err := db.SaveInstall("c", 1, "shop.example.test", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.ActivateCandidate(first.CandidateID, "T"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if _, err := db.Uninstall(1, "shop.example.test", "pw"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.SaveInstall("c2", 1, "shop.example.test", "pw2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Generation <= first.Generation {
+		t.Fatalf("generation reused: %d then %d", first.Generation, second.Generation)
+	}
+}
+
+func TestUpgradeFromQueueSchema(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+	key := bytes32(t)
+
+	freshPath := filepath.Join(dir, "fresh.db")
+	fresh, err := storage.New(freshPath, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := fresh.SaveInstall("src", 4, "keep.example.test", "migrated-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := fresh.ActivateCandidate(saved.CandidateID, "Kept"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	var cipher string
+	if err := fresh.DB().QueryRow(`SELECT password FROM stores WHERE id = 4`).Scan(&cipher); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Close()
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSchema := `
+		CREATE TABLE stores (
+			id INTEGER PRIMARY KEY,
+			shop TEXT NOT NULL UNIQUE,
+			password TEXT NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			generation INTEGER NOT NULL DEFAULT 1,
+			installation_epoch INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL
+		);
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL,
+			user_id TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			installation_epoch INTEGER NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE TABLE challenges (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL,
+			nonce TEXT NOT NULL,
+			browser_id TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE TABLE candidates (
+			id TEXT PRIMARY KEY,
+			store_id INTEGER NOT NULL,
+			shop TEXT NOT NULL,
+			password TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL DEFAULT 3,
+			last_error TEXT NOT NULL DEFAULT '',
+			lease_token TEXT NOT NULL DEFAULT '',
+			next_attempt_at TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')));
+		INSERT INTO schema_version (version, applied_at) VALUES (1, datetime('now')), (2, datetime('now'));
+	`
+	if _, err := raw.Exec(oldSchema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO stores (id, shop, password, title, generation, installation_epoch, created_at)
+		VALUES (4, 'keep.example.test', ?, 'Kept', 3, 9, datetime('now'))`, cipher); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO sessions (id, store_id, user_id, generation, installation_epoch, expires_at, created_at)
+		VALUES ('old', 4, 'u', 3, 9, datetime('now', '+1 day'), datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	for i, created := range []string{"datetime('now')", "datetime('now', '-10 days')"} {
+		q := `INSERT INTO candidates (id, store_id, shop, password, generation, attempts, max_attempts, last_error, lease_token, next_attempt_at, created_at, updated_at)
+			VALUES (?, 4, 'keep.example.test', ?, ?, 3, 3, '', '', datetime('now'), ` + created + `, datetime('now'))`
+		if _, err := raw.Exec(q, "cand-"+string(rune('a'+i)), cipher, 4+i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw.Close()
+
+	upgraded, err := storage.New(path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	store, err := upgraded.GetActiveStore(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Password != "migrated-secret" || store.Title != "Kept" {
+		t.Fatalf("store = %+v", store)
+	}
+	if _, _, err := upgraded.VerifySession("old"); err != storage.ErrNotFound {
+		t.Fatalf("old session survived: %v", err)
+	}
+	n, err := upgraded.CountCandidates("keep.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("candidates after ttl migration = %d", n)
+	}
+	gen, err := upgraded.GenerationValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen <= 9 {
+		t.Fatalf("counter %d is not above saved epoch", gen)
+	}
+	var attempts string
+	err = upgraded.DB().QueryRow(`SELECT name FROM pragma_table_info('candidates') WHERE name = 'lease_token'`).Scan(&attempts)
+	if err != sql.ErrNoRows {
+		t.Fatalf("lease column present: %v", err)
+	}
+}
+
+func bytes32(t *testing.T) []byte {
+	t.Helper()
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)
 	}
-	keyHex := hex.EncodeToString(key)
-
-	keyBytes, _ := hex.DecodeString(keyHex)
-
-	db, err := storage.New(dbPath, keyBytes)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     42,
-		Shop:        "shop.myinsales.ru",
-		Password:    "secret-password",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	if err := db.CreateCandidate(c); err != nil {
-		t.Fatal(err)
-	}
-	db.PromoteCandidate("cand-1", "My Shop")
-	db.Close()
-
-	// Reopen
-	db2, err := storage.New(dbPath, keyBytes)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer db2.Close()
-
-	store, err := db2.GetActiveStore(42)
-	if err != nil {
-		t.Fatalf("GetActiveStore after reopen: %v", err)
-	}
-	if store.Shop != "shop.myinsales.ru" {
-		t.Errorf("shop = %q", store.Shop)
-	}
-	if store.Password != "secret-password" {
-		t.Errorf("password = %q", store.Password)
-	}
-}
-
-func TestUninstallAuthorized(t *testing.T) {
-	db := newTestDB(t)
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "mypass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-	db.PromoteCandidate("cand-1", "Shop")
-
-	// Correct password
-	ok, err := db.UninstallStore(1, "mypass")
-	if err != nil {
-		t.Fatalf("UninstallStore: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected uninstall to succeed")
-	}
-
-	// Store should be gone
-	_, err = db.GetActiveStore(1)
-	if err != storage.ErrNotFound {
-		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
-}
-
-func TestUninstallWrongPassword(t *testing.T) {
-	db := newTestDB(t)
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "correct-pass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-	db.PromoteCandidate("cand-1", "Shop")
-
-	_, err := db.UninstallStore(1, "wrong-pass")
-	if err != storage.ErrNotAuthorized {
-		t.Fatalf("expected ErrNotAuthorized, got %v", err)
-	}
-}
-
-func TestUninstallViaCandidate(t *testing.T) {
-	db := newTestDB(t)
-
-	// Only a candidate exists (no active store) with correct password
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "candidate-shop.myinsales.ru",
-		Password:    "candidate-pass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-
-	ok, err := db.UninstallStore(1, "candidate-pass")
-	if err != nil {
-		t.Fatalf("UninstallStore via candidate: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected uninstall via candidate to succeed")
-	}
-}
-
-func TestUninstallViaCandidateWrongPassword(t *testing.T) {
-	db := newTestDB(t)
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "candidate-shop.myinsales.ru",
-		Password:    "correct-candidate-pass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-
-	_, err := db.UninstallStore(1, "wrong-password")
-	if err != storage.ErrNotAuthorized {
-		t.Fatalf("expected ErrNotAuthorized for candidate wrong password, got %v", err)
-	}
-}
-
-func TestUninstallStorePasswordMismatchButCandidateMatches(t *testing.T) {
-	db := newTestDB(t)
-
-	// Active store with password-1
-	c1 := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "password-1",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c1)
-	db.PromoteCandidate("cand-1", "Shop")
-
-	// Candidate with password-2 (e.g. reinstall in progress)
-	c2 := &storage.Candidate{
-		ID:          "cand-2",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "password-2",
-		Generation:  2,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c2)
-
-	// Uninstall with password-2 (the candidate's password, not the active store's).
-	// Per security hardening (#5): this must only remove the matching candidate,
-	// NOT the active store (which has a different credential).
-	ok, err := db.UninstallStore(1, "password-2")
-	if err != nil {
-		t.Fatalf("UninstallStore: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected uninstall to succeed with candidate password")
-	}
-
-	// Candidate should be gone
-	var count int
-	db.DB().QueryRow("SELECT COUNT(*) FROM candidates WHERE id = 'cand-2'").Scan(&count)
-	if count > 0 {
-		t.Error("expected candidate cand-2 to be deleted")
-	}
-
-	// Active store must survive (different credential)
-	store, err := db.GetActiveStore(1)
-	if err != nil {
-		t.Fatal("expected active store to survive uninstall with candidate password")
-	}
-	if store.Password != "password-1" {
-		t.Errorf("store password = %q, want %q", store.Password, "password-1")
-	}
-}
-
-func TestUninstallIdempotentNoData(t *testing.T) {
-	db := newTestDB(t)
-
-	// Nothing exists for this store
-	ok, err := db.UninstallStore(999, "whatever")
-	if err != nil {
-		t.Fatalf("UninstallStore on missing store: %v", err)
-	}
-	if ok {
-		t.Fatal("expected false for non-existent store")
-	}
-}
-
-func TestSessionCreateAndGet(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now()
-	db.SetClock(func() time.Time { return now })
-
-	// Setup store first
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "pass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-	db.PromoteCandidate("cand-1", "Shop")
-
-	if err := db.CreateSession("sess-1", 1, "user-1", 1, 1, 5*time.Minute); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-
-	sess, err := db.GetSession("sess-1")
-	if err != nil {
-		t.Fatalf("GetSession: %v", err)
-	}
-	if sess.StoreID != 1 || sess.UserID != "user-1" {
-		t.Errorf("session data mismatch: %+v", sess)
-	}
-}
-
-func TestSessionExpired(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now()
-	db.SetClock(func() time.Time { return now })
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "pass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-	db.PromoteCandidate("cand-1", "Shop")
-
-	db.CreateSession("sess-1", 1, "user-1", 1, 1, -1*time.Minute) // already expired
-
-	_, err := db.GetSession("sess-1")
-	if err != storage.ErrNotFound {
-		t.Fatalf("expected ErrNotFound for expired session, got %v", err)
-	}
-}
-
-func TestChallengeConsume(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now()
-	db.SetClock(func() time.Time { return now })
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "pass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-	db.PromoteCandidate("cand-1", "Shop")
-
-	if err := db.CreateChallenge("ch-1", 1, "my-nonce", "browser-1", 5*time.Minute); err != nil {
-		t.Fatalf("CreateChallenge: %v", err)
-	}
-
-	ch, err := db.ConsumeChallenge("ch-1", "browser-1")
-	if err != nil {
-		t.Fatalf("ConsumeChallenge: %v", err)
-	}
-	if ch.Nonce != "my-nonce" {
-		t.Errorf("nonce = %q", ch.Nonce)
-	}
-
-	// Second consume should fail
-	_, err = db.ConsumeChallenge("ch-1", "browser-1")
-	if err != storage.ErrNotFound {
-		t.Fatalf("expected ErrNotFound on second consume, got %v", err)
-	}
-}
-
-func TestChallengeWrongBrowser(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now()
-	db.SetClock(func() time.Time { return now })
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "pass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-	db.PromoteCandidate("cand-1", "Shop")
-
-	db.CreateChallenge("ch-1", 1, "my-nonce", "browser-1", 5*time.Minute)
-	_, err := db.ConsumeChallenge("ch-1", "browser-2")
-	if err != storage.ErrNotAuthorized {
-		t.Fatalf("expected ErrNotAuthorized, got %v", err)
-	}
-}
-
-func TestUninstallRemovesSessionsAndChallenges(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now()
-	db.SetClock(func() time.Time { return now })
-
-	c := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "mypass",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	db.CreateCandidate(c)
-	db.PromoteCandidate("cand-1", "Shop")
-
-	db.CreateSession("sess-1", 1, "user-1", 1, 1, 1*time.Hour)
-	db.CreateChallenge("ch-1", 1, "nonce", "browser", 1*time.Hour)
-
-	db.UninstallStore(1, "mypass")
-
-	_, err := db.GetSession("sess-1")
-	if err != storage.ErrNotFound {
-		t.Error("expected session to be deleted after uninstall")
-	}
-
-	_, err = db.ConsumeChallenge("ch-1", "browser")
-	if err != storage.ErrNotFound {
-		t.Error("expected challenge to be deleted after uninstall")
-	}
-}
-
-func TestTransactionIsolation(t *testing.T) {
-	db := newTestDB(t)
-
-	// Two candidates for same store with different generations
-	c1 := &storage.Candidate{
-		ID:          "cand-1",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "pass-old",
-		Generation:  1,
-		MaxAttempts: 3,
-	}
-	c2 := &storage.Candidate{
-		ID:          "cand-2",
-		StoreID:     1,
-		Shop:        "shop.myinsales.ru",
-		Password:    "pass-new",
-		Generation:  2,
-		MaxAttempts: 3,
-	}
-	if err := db.CreateCandidate(c1); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.CreateCandidate(c2); err != nil {
-		t.Fatal(err)
-	}
-
-	// Promote newer one first
-	promoted, err := db.PromoteCandidate("cand-2", "New Shop")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !promoted {
-		t.Fatal("expected cand-2 to be promoted")
-	}
-
-	// Old candidate should not overwrite
-	promoted, err = db.PromoteCandidate("cand-1", "Old Shop")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if promoted {
-		t.Fatal("expected cand-1 to NOT be promoted (older generation)")
-	}
-
-	store, _ := db.GetActiveStore(1)
-	if store.Title != "New Shop" {
-		t.Errorf("expected 'New Shop', got %q", store.Title)
-	}
+	return key
 }
