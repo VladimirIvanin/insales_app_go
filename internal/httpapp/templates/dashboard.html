@@ -50,10 +50,10 @@ footer { margin-top: 2rem; font-size: 0.8rem; color: #9ca3af; text-align: center
 {{end}}
 
 <div class="action-buttons">
-<form action="/probe" method="POST">
+<form action="/probe?store_id={{.StoreID}}" method="POST">
 <button type="submit" class="btn btn-primary">Проверить API</button>
 </form>
-<form action="/logout" method="POST">
+<form action="/logout?store_id={{.StoreID}}" method="POST">
 <button type="submit" class="btn btn-outline">Выйти</button>
 </form>
 </div>

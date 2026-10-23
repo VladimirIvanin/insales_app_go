@@ -79,12 +79,39 @@ type InstallResult struct {
 	Created     bool
 }
 
-// HandleInstall saves a pending install and does not call the InSales API.
-func (s *Service) HandleInstall(_ context.Context, params InstallParams) (*InstallResult, error) {
+// HandleInstall saves a pending install, checking the backlog through the API only when full.
+func (s *Service) HandleInstall(ctx context.Context, params InstallParams) (*InstallResult, error) {
 	password := insales.InstallPassword(params.Token, s.appSecret)
 	saved, err := s.store.SaveInstall(randomHex(16), params.InsalesID, params.Shop, password)
 	if errors.Is(err, storage.ErrCapacity) {
-		return nil, ErrCapacity
+		backlog, readErr := s.store.PendingForShop(params.Shop)
+		if readErr != nil {
+			return nil, readErr
+		}
+		admissionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		for i := range backlog {
+			if admissionCtx.Err() != nil {
+				break
+			}
+			account, verifyErr := s.requestAccount(admissionCtx, &backlog[i])
+			var api *insales.APIError
+			invalid := verifyErr == nil && account.ID != backlog[i].StoreID
+			invalid = invalid || (errors.As(verifyErr, &api) && (api.Status == 401 || api.Status == 403))
+			if invalid {
+				if err := s.store.DeleteCandidate(backlog[i].ID); err != nil {
+					return nil, err
+				}
+				saved, err = s.store.SaveInstall(randomHex(16), params.InsalesID, params.Shop, password)
+				break
+			}
+			if verifyErr != nil {
+				break
+			}
+		}
+		if errors.Is(err, storage.ErrCapacity) {
+			return nil, ErrCapacity
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("save install: %w", err)
@@ -157,9 +184,6 @@ func (s *Service) resolveStore(ctx context.Context, storeID int, shop string) (*
 	if errors.Is(err, storage.ErrNotFound) {
 		active = nil
 	}
-	if active != nil && active.Shop != shop {
-		return nil, ErrForbidden
-	}
 
 	pending, err := s.store.NewestPending(storeID, shop)
 	if err != nil {
@@ -168,6 +192,9 @@ func (s *Service) resolveStore(ctx context.Context, storeID int, shop string) (*
 	usePending := pending != nil && (active == nil || pending.Generation > active.Generation)
 	if !usePending {
 		if active != nil {
+			if active.Shop != shop {
+				return nil, ErrForbidden
+			}
 			return active, nil
 		}
 		other, err := s.store.HasOtherShop(storeID, shop)
@@ -180,10 +207,7 @@ func (s *Service) resolveStore(ctx context.Context, storeID int, shop string) (*
 		return nil, ErrStoreNotInstalled
 	}
 
-	verifyCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
-	defer cancel()
-	client := s.newClient("https://"+pending.Shop, pending.Password)
-	account, err := client.GetAccount(verifyCtx)
+	account, err := s.requestAccount(ctx, pending)
 	if err != nil {
 		return s.fallbackAfterVerify(storeID, shop, pending.ID, err)
 	}
@@ -212,6 +236,10 @@ func (s *Service) fallbackAfterVerify(storeID int, shop, candidateID string, cau
 	if errors.As(cause, &resource) {
 		return s.activeOr(storeID, shop, fmt.Errorf("%w: %v", ErrVerification, cause))
 	}
+	var api *insales.APIError
+	if !errors.As(cause, &api) || (api.Status != 401 && api.Status != 403) {
+		return s.activeOr(storeID, shop, fmt.Errorf("%w: %v", ErrTemporary, cause))
+	}
 	if err := s.store.DeleteCandidate(candidateID); err != nil {
 		return nil, err
 	}
@@ -227,6 +255,33 @@ func (s *Service) activeOr(storeID int, shop string, otherwise error) (*storage.
 		return active, nil
 	}
 	return nil, otherwise
+}
+
+func (s *Service) requestAccount(ctx context.Context, pending *storage.Candidate) (account *insales.Account, err error) {
+	token, err := s.store.ClaimVerification(pending.Shop)
+	if err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return nil, ErrTemporary
+	}
+	delay := time.Duration(0)
+	defer func() { err = errors.Join(err, s.store.ReleaseVerification(pending.Shop, token, delay)) }()
+	verifyCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
+	defer cancel()
+	client := s.newClient("https://"+pending.Shop, pending.Password)
+	account, err = client.GetAccount(verifyCtx)
+	if err != nil {
+		var api *insales.APIError
+		if !errors.As(err, &api) || (api.Status != 401 && api.Status != 403) {
+			delay = 5 * time.Second
+			if api != nil && api.RetryAfter > 5 {
+				seconds := min(api.RetryAfter, 86400)
+				delay = time.Duration(seconds) * time.Second
+			}
+		}
+	}
+	return account, err
 }
 
 // BuildLoginRedirectURL builds the InSales redirect URL for the login flow.

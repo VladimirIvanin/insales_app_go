@@ -811,6 +811,8 @@ func TestForgedInstallDoesNotEvictAcceptedCandidate(t *testing.T) {
 	shop := sharedTestShop(1)
 	realToken := "real-install-token"
 	realPassword := insales.InstallPassword(realToken, "test-app-secret")
+	fx.Sim.ConfigureStore(7, realPassword)
+	fx.Sim.SetAccount(7, "Genuine shop")
 
 	status, body := getStatus(t, fmt.Sprintf("%s/install?shop=%s&token=%s&insales_id=7",
 		srv.URL, url.QueryEscape(shop), url.QueryEscape(realToken)))
@@ -833,8 +835,8 @@ func TestForgedInstallDoesNotEvictAcceptedCandidate(t *testing.T) {
 			t.Fatalf("forged install %d status = %d, body = %s", i, status, body)
 		}
 	}
-	if rejected != 1 {
-		t.Fatalf("rejected forged installs = %d, want 1", rejected)
+	if rejected != 0 {
+		t.Fatalf("rejected forged installs = %d, want 0 after rejecting an invalid candidate", rejected)
 	}
 
 	pending, err := fx.DB.NewestPending(7, shop)

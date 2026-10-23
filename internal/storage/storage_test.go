@@ -77,7 +77,7 @@ func TestInstallLimitDedupAndTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := db.SaveInstall("c2", 99, "shop.example.test", "same")
+	again, err := db.SaveInstall("c2", 1, "shop.example.test", "same")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,4 +520,23 @@ func bytes32(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return key
+}
+
+func TestPendingDedupKeepsClaimedIdentity(t *testing.T) {
+	db := newTestDB(t)
+	first, err := db.SaveInstall("first", 999, "shop.example.test", "same-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := db.SaveInstall("actual", 42, "shop.example.test", "same-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !actual.Created || actual.CandidateID == first.CandidateID {
+		t.Fatalf("identity was merged: %+v", actual)
+	}
+	pending, err := db.NewestPending(42, "shop.example.test")
+	if err != nil || pending == nil || pending.StoreID != 42 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
 }

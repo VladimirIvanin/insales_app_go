@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -313,28 +312,26 @@ func TestParallelLoginsActivateOnce(t *testing.T) {
 	if _, err := lc.HandleInstall(context.Background(), lifecycle.InstallParams{Shop: "shop.example.test", Token: "tok", InsalesID: 7}); err != nil {
 		t.Fatal(err)
 	}
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, err := lc.HandleLogin(context.Background(), lifecycle.LoginParams{Shop: "shop.example.test", InsalesID: 7}, "b")
-			errs <- err
-		}()
+	errs := make(chan error, 1)
+	go func() {
+		_, err := lc.HandleLogin(context.Background(), lifecycle.LoginParams{Shop: "shop.example.test", InsalesID: 7}, "first")
+		errs <- err
+	}()
+	<-started
+	_, held := lc.HandleLogin(context.Background(), lifecycle.LoginParams{Shop: "shop.example.test", InsalesID: 7}, "second")
+	if !errors.Is(held, lifecycle.ErrTemporary) {
+		close(release)
+		t.Fatalf("concurrent verification = %v, want temporary backpressure", held)
 	}
-	<-started
-	<-started
 	close(release)
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
+	if err := <-errs; err != nil {
+		t.Fatal(err)
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("calls = %d", calls.Load())
+	if _, err := lc.HandleLogin(context.Background(), lifecycle.LoginParams{Shop: "shop.example.test", InsalesID: 7}, "second"); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want one shared verification", calls.Load())
 	}
 	store, err := db.GetActiveStore(7)
 	if err != nil || store.Title != "Once" {

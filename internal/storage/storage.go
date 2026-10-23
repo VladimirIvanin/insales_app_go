@@ -48,6 +48,7 @@ var Migrations = []Migration{
 	{Version: 1, Name: "начальная схема"},
 	{Version: 2, Name: "installation_epoch"},
 	{Version: 3, Name: "проверка при входе и один счётчик поколений"},
+	{Version: 4, Name: "бюджет проверки установок"},
 }
 
 // Store is a verified shop connection.
@@ -178,6 +179,7 @@ func (s *DB) Upgrade() error {
 		{1, s.migrateV1},
 		{2, s.migrateV2},
 		{3, s.migrateV3},
+		{4, s.migrateV4},
 	}
 	for _, step := range steps {
 		applied, err := s.versionApplied(step.version)
@@ -543,7 +545,7 @@ func (s *DB) SaveInstall(candidateID string, storeID int, shop, password string)
 	}
 	var keeper *Candidate
 	for i := range rows {
-		if passwordsEqual(password, []byte(rows[i].Password)) {
+		if rows[i].StoreID == storeID && passwordsEqual(password, []byte(rows[i].Password)) {
 			if keeper == nil || rows[i].Generation > keeper.Generation {
 				copyRow := rows[i]
 				keeper = &copyRow
@@ -552,7 +554,7 @@ func (s *DB) SaveInstall(candidateID string, storeID int, shop, password string)
 	}
 	if keeper != nil {
 		for _, row := range rows {
-			if row.ID != keeper.ID && passwordsEqual(password, []byte(row.Password)) {
+			if row.StoreID == storeID && row.ID != keeper.ID && passwordsEqual(password, []byte(row.Password)) {
 				if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, row.ID); err != nil {
 					return InstallSave{}, err
 				}
@@ -1137,4 +1139,82 @@ func (s *DB) GenerationValue() (int64, error) {
 		return 0, ErrNotFound
 	}
 	return v, err
+}
+
+func (s *DB) migrateV4() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE verification_budgets (
+        shop TEXT PRIMARY KEY, window_started REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0, lease_token TEXT
+    )`); err != nil {
+		return err
+	}
+	if err := s.recordVersion(tx, 4); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *DB) PendingForShop(shop string) ([]Candidate, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	candidates, err := s.candidatesForShop(tx, shop)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func (s *DB) ClaimVerification(shop string) (string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	now := float64(s.now().UnixNano()) / 1e9
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO verification_budgets (shop, window_started) VALUES (?, ?)`, shop, now); err != nil {
+		return "", err
+	}
+	var started, next, lease float64
+	var attempts int
+	if err := tx.QueryRow(`SELECT window_started, attempts, next_attempt_at, lease_until FROM verification_budgets WHERE shop = ?`, shop).Scan(&started, &attempts, &next, &lease); err != nil {
+		return "", err
+	}
+	if next > now || lease > now {
+		return "", nil
+	}
+	if started <= now-60 {
+		started, attempts = now, 0
+	}
+	if attempts >= 10 {
+		return "", nil
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(raw)
+	if _, err := tx.Exec(`UPDATE verification_budgets SET attempts = ?, window_started = ?, lease_until = ?, lease_token = ? WHERE shop = ?`, attempts+1, started, now+15, token, shop); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (s *DB) ReleaseVerification(shop, token string, delay time.Duration) error {
+	next := float64(s.now().Add(delay).UnixNano()) / 1e9
+	_, err := s.db.Exec(`UPDATE verification_budgets SET lease_until = 0, lease_token = NULL, next_attempt_at = ? WHERE shop = ? AND lease_token = ?`, next, shop, token)
+	return err
 }

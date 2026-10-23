@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -147,8 +148,13 @@ func (c *Client) do(ctx context.Context, method, path string, payload []byte) ([
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		apiErr := &APIError{Status: resp.StatusCode, Body: string(raw)}
 		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
-			if _, scanErr := fmt.Sscanf(retryAfter, "%d", &apiErr.RetryAfter); scanErr != nil {
-				apiErr.RetryAfter = 0
+			if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil && seconds > 0 {
+				apiErr.RetryAfter = seconds
+			} else if deadline, parseErr := http.ParseTime(retryAfter); parseErr == nil {
+				remaining := time.Until(deadline)
+				if remaining > 0 {
+					apiErr.RetryAfter = int((remaining + time.Second - 1) / time.Second)
+				}
 			}
 		}
 		return nil, apiErr

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -343,7 +344,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Build redirect URL to InSales with the nonce
 	nonce := result.Nonce
-	redirectURL := lifecycle.BuildLoginRedirectURL(shop, a.cfg.AppID, nonce, a.cfg.BaseURL+"/auth/callback")
+	redirectURL := lifecycle.BuildLoginRedirectURL(shop, a.cfg.AppID, nonce, a.cfg.BaseURL+"/auth/callback?flow="+url.QueryEscape(result.ChallengeID))
 
 	slog.Info("login initiated", "shop", shop, "insales_id", insalesID)
 
@@ -373,7 +374,10 @@ func (a *App) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	challengeID := getChallengeID(r)
+	challengeID := r.URL.Query().Get("flow")
+	if challengeID == "" {
+		challengeID = getChallengeID(r)
+	}
 	if challengeID == "" {
 		writeError(w, a.tmpls, "Нет активного запроса на вход", http.StatusUnauthorized)
 		return
@@ -416,7 +420,7 @@ func (a *App) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	slog.Info("user logged in", "store", result.StoreID)
 
 	// Redirect to dashboard
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, fmt.Sprintf("/?store_id=%d", result.StoreID), http.StatusFound)
 }
 
 // handleDashboard processes GET / — shows the main app page.
@@ -436,6 +440,11 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.clearSessionCookie(w)
 		writeError(w, a.tmpls, "Сессия истекла. Войдите снова.", http.StatusUnauthorized)
+		return
+	}
+
+	if wrongTab(r, store.ID) {
+		http.Error(w, "Другая вкладка сменила магазин. Откройте приложение из нужного магазина.", http.StatusConflict)
 		return
 	}
 
@@ -470,6 +479,11 @@ func (a *App) handleProbe(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.clearSessionCookie(w)
 		http.Error(w, "Session expired", http.StatusUnauthorized)
+		return
+	}
+
+	if wrongTab(r, store.ID) {
+		http.Error(w, "Другая вкладка сменила магазин. Откройте приложение из нужного магазина.", http.StatusConflict)
 		return
 	}
 
@@ -513,6 +527,12 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := getSessionID(r)
+	if sessionID != "" {
+		if _, store, err := a.lifecycle.VerifySession(sessionID); err == nil && wrongTab(r, store.ID) {
+			http.Error(w, "Другая вкладка сменила магазин.", http.StatusConflict)
+			return
+		}
+	}
 	if sessionID != "" {
 		if err := a.lifecycle.Logout(sessionID); err != nil {
 			slog.Error("logout failed", "error", err)
@@ -605,4 +625,9 @@ func writeError(w http.ResponseWriter, tmpls *template.Template, message string,
 	if err := tmpls.ExecuteTemplate(w, "error.html", ErrorData{Message: message}); err != nil {
 		slog.Error("render error page", "error", err)
 	}
+}
+
+func wrongTab(r *http.Request, storeID int) bool {
+	expected := r.URL.Query().Get("store_id")
+	return expected != "" && expected != strconv.Itoa(storeID)
 }
