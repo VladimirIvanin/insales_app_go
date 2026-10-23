@@ -27,7 +27,7 @@ type Config struct {
 
 // Load reads .env without overriding existing variables, then reads the environment.
 func Load() (*Config, error) {
-	if err := loadDotEnv(".env"); err != nil {
+	if err := loadDotEnv(); err != nil {
 		return nil, err
 	}
 
@@ -124,9 +124,16 @@ func normalizeAllowlist(raw string) ([]string, error) {
 	return out, nil
 }
 
-// loadDotEnv sets variables from path when they are not already in the environment.
-func loadDotEnv(path string) error {
-	f, err := os.Open(path)
+// loadDotEnv reads .env from the working directory when variables are not already set.
+// The file is opened through os.Root so the name cannot leave that directory.
+func loadDotEnv() error {
+	root, err := os.OpenRoot(".")
+	if err != nil {
+		return fmt.Errorf("open .env: %w", err)
+	}
+	defer root.Close()
+
+	f, err := root.Open(".env")
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
