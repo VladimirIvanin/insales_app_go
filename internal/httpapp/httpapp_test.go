@@ -49,7 +49,7 @@ func testConfig() *config.Config {
 		AppID:         "test-app-id",
 		AppSecret:     "test-app-secret",
 		BaseURL:       "http://localhost:9999",
-		AllowedShops:  nil, // allow all
+		AllowedShops:  []string{"myinsales.ru"}, // tests use subdomains under this
 		DBPath:        ":memory:",
 		BindHost:      "127.0.0.1",
 		Port:          0,
@@ -304,7 +304,7 @@ func extractNonce(t *testing.T, redirectURL string) string {
 // factory always connects to sim.ShopURL(), so the actual shop domain doesn't
 // need to resolve.
 func sharedTestShop(storeID int) string {
-	return fmt.Sprintf("shop-%d.test", storeID)
+	return fmt.Sprintf("shop-%d.myinsales.ru", storeID)
 }
 
 // TestInstallFullFlow tests the complete install flow:
@@ -350,21 +350,20 @@ func TestUninstallWhilePending(t *testing.T) {
 	// Configure store but DON'T have the simulator verify yet
 	fx.Sim.SetAccount(storeID, "Test Shop")
 
-	// We'll gate the API call so we can uninstall while verification is blocked
-	var gate sync.WaitGroup
-	gate.Add(1)
-
-	// Recreate lifecycle with a gated API
-	fx.Sim.RespondNext("GET", "/admin/account.json", testutil.Response{
-		Status: 200,
-		Body:   `{"id":42,"title":"Test Shop"}`,
-		Wait:   make(chan struct{}),
-	})
+	// Gate the API call so we can uninstall while verification is blocked.
+	// Set RespondNext BEFORE install so the worker hits it.
+	release := make(chan struct{})
 
 	token := "install-token-1"
 	password := fx.Sim.InstallPassword(token)
 
 	fx.Sim.ConfigureStore(storeID, password)
+
+	fx.Sim.RespondNext("GET", "/admin/account.json", testutil.Response{
+		Status: 200,
+		Body:   `{"id":42,"title":"Test Shop"}`,
+		Wait:   release,
+	})
 
 	// Install — creates candidate
 	installURL := srv.URL + "/install"
@@ -376,11 +375,24 @@ func TestUninstallWhilePending(t *testing.T) {
 		t.Fatalf("install status = %d", statusCode)
 	}
 
-	// At this point, the background worker may try to claim and verify.
-	// Let the verification start but block at the API call.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the background worker to claim and block on the API call
+	// by polling the candidate table.
+	claimed := func() bool {
+		var count int
+		fx.DB.DB().QueryRow("SELECT COUNT(*) FROM candidates WHERE attempts > 0 AND last_error = ''").Scan(&count)
+		return count > 0
+	}
+	for i := 0; i < 100; i++ {
+		if claimed() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !claimed() {
+		t.Fatal("candidate was not claimed by background worker")
+	}
 
-	// Uninstall while verification is in flight
+	// Uninstall while verification is blocked at the API call
 	uninstallURL := srv.URL + "/uninstall"
 	uStatus, uErr := fx.Sim.Uninstall(uninstallURL, shop, password)
 	if uErr != nil {
@@ -396,12 +408,18 @@ func TestUninstallWhilePending(t *testing.T) {
 		t.Fatalf("expected store to be removed, got err = %v", err)
 	}
 
-	// Verify candidates are gone too (uninstall removes them)
-	_, err = fx.DB.ClaimCandidate()
-	if err != nil {
-		t.Fatalf("ClaimCandidate: %v", err)
+	// Release the blocked API call
+	close(release)
+
+	// Give the worker time to finish PromoteCandidate and detect
+	// the candidate was cancelled/removed by the preceding uninstall.
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify no store appeared after late API response
+	_, err = fx.DB.GetActiveStore(storeID)
+	if err != storage.ErrNotFound {
+		t.Fatalf("store should remain gone after late API response, got err = %v", err)
 	}
-	// If no candidates, it returns nil, nil
 
 	t.Log("uninstall while verification pending: OK")
 }
@@ -1074,8 +1092,11 @@ func TestProbeWithSession(t *testing.T) {
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "API") {
-		t.Errorf("probe body does not contain API result: %s", string(body))
+	if !strings.Contains(string(body), "Test Shop") {
+		t.Errorf("probe body does not contain account title %q: %s", "Test Shop", string(body))
+	}
+	if !strings.Contains(string(body), "ID: 42") {
+		t.Errorf("probe body does not contain account ID: %s", string(body))
 	}
 }
 

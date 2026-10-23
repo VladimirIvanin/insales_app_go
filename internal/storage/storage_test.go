@@ -285,7 +285,9 @@ func TestUninstallStorePasswordMismatchButCandidateMatches(t *testing.T) {
 	}
 	db.CreateCandidate(c2)
 
-	// Uninstall with password-2 (the candidate's password, not the active store's)
+	// Uninstall with password-2 (the candidate's password, not the active store's).
+	// Per security hardening (#5): this must only remove the matching candidate,
+	// NOT the active store (which has a different credential).
 	ok, err := db.UninstallStore(1, "password-2")
 	if err != nil {
 		t.Fatalf("UninstallStore: %v", err)
@@ -294,10 +296,20 @@ func TestUninstallStorePasswordMismatchButCandidateMatches(t *testing.T) {
 		t.Fatal("expected uninstall to succeed with candidate password")
 	}
 
-	// Both store and candidate should be gone
-	_, err = db.GetActiveStore(1)
-	if err != storage.ErrNotFound {
-		t.Fatal("expected store to be deleted")
+	// Candidate should be gone
+	var count int
+	db.DB().QueryRow("SELECT COUNT(*) FROM candidates WHERE id = 'cand-2'").Scan(&count)
+	if count > 0 {
+		t.Error("expected candidate cand-2 to be deleted")
+	}
+
+	// Active store must survive (different credential)
+	store, err := db.GetActiveStore(1)
+	if err != nil {
+		t.Fatal("expected active store to survive uninstall with candidate password")
+	}
+	if store.Password != "password-1" {
+		t.Errorf("store password = %q, want %q", store.Password, "password-1")
 	}
 }
 
@@ -331,7 +343,7 @@ func TestSessionCreateAndGet(t *testing.T) {
 	db.CreateCandidate(c)
 	db.PromoteCandidate("cand-1", "Shop")
 
-	if err := db.CreateSession("sess-1", 1, "user-1", 1, 5*time.Minute); err != nil {
+	if err := db.CreateSession("sess-1", 1, "user-1", 1, 1, 5*time.Minute); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 
@@ -360,7 +372,7 @@ func TestSessionExpired(t *testing.T) {
 	db.CreateCandidate(c)
 	db.PromoteCandidate("cand-1", "Shop")
 
-	db.CreateSession("sess-1", 1, "user-1", 1, -1*time.Minute) // already expired
+	db.CreateSession("sess-1", 1, "user-1", 1, 1, -1*time.Minute) // already expired
 
 	_, err := db.GetSession("sess-1")
 	if err != storage.ErrNotFound {
@@ -442,7 +454,7 @@ func TestUninstallRemovesSessionsAndChallenges(t *testing.T) {
 	db.CreateCandidate(c)
 	db.PromoteCandidate("cand-1", "Shop")
 
-	db.CreateSession("sess-1", 1, "user-1", 1, 1*time.Hour)
+	db.CreateSession("sess-1", 1, "user-1", 1, 1, 1*time.Hour)
 	db.CreateChallenge("ch-1", 1, "nonce", "browser", 1*time.Hour)
 
 	db.UninstallStore(1, "mypass")

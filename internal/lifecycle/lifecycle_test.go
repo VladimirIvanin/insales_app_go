@@ -184,7 +184,7 @@ func TestFullLifecycle(t *testing.T) {
 
 	// 4. Logout test — create session and verify
 	sessionID := "test-session-id"
-	if err := db.CreateSession(sessionID, 42, "user-1", store.Generation, 1*time.Hour); err != nil {
+	if err := db.CreateSession(sessionID, 42, "user-1", store.Generation, store.InstallationEpoch, 1*time.Hour); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 
@@ -231,7 +231,7 @@ func TestSessionGenerationCheck(t *testing.T) {
 	}
 	db.CreateCandidate(c)
 	db.PromoteCandidate("cand-1", "Shop")
-	db.CreateSession("sess-1", 1, "user-1", 1, 1*time.Hour)
+	db.CreateSession("sess-1", 1, "user-1", 1, 1, 1*time.Hour)
 
 	// Verify works with gen 1
 	lc.SetClock(func() time.Time { return now })
@@ -278,8 +278,8 @@ func TestTwoStoresIsolation(t *testing.T) {
 	db.PromoteCandidate("cand-2", "Shop Two")
 
 	// Create sessions for each store
-	db.CreateSession("sess-store1", 1, "user-1", 1, 1*time.Hour)
-	db.CreateSession("sess-store2", 2, "user-2", 1, 1*time.Hour)
+	db.CreateSession("sess-store1", 1, "user-1", 1, 1, 1*time.Hour)
+	db.CreateSession("sess-store2", 2, "user-2", 1, 1, 1*time.Hour)
 
 	// Verify each session
 	_, store1, err := lc.VerifySession("sess-store1")

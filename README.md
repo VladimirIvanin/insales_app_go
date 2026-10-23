@@ -32,6 +32,8 @@ cd insales_app_go
 # Скопировать и настроить переменные окружения
 cp .env.example .env
 # Отредактировать .env со своими значениями
+# Загрузить переменные в окружение (код использует os.Getenv)
+export $(grep -v '^\s*#' .env | xargs)
 
 # Запустить тесты
 go test -race -coverprofile=coverage.out ./...
@@ -50,7 +52,7 @@ go build -o bin/server ./cmd/server
 | `INSALES_APP_ID` | Да | Публичный идентификатор приложения |
 | `INSALES_APP_SECRET` | Да | Секретный ключ приложения |
 | `APP_BASE_URL` | Да | Публичный URL приложения (для callback) |
-| `ALLOWED_SHOPS` | Нет | Список разрешённых доменов магазинов через запятую |
+| `ALLOWED_SHOPS` | Да | Список разрешённых доменов магазинов через запятую. **Обязателен.** Пустое значение = отказ всем доменам. |
 | `APP_DB` | Нет | Путь к файлу SQLite (по умолчанию `runtime/app.sqlite3`) |
 | `BIND_HOST` | Нет | Адрес для привязки сервера (по умолчанию `127.0.0.1`) |
 | `PORT` | Нет | Порт сервера (по умолчанию `8765`) |
@@ -97,12 +99,11 @@ internal/
   insales/
     protocol.go       # Формулы MD5 (password, token, token2, token3)
     client.go         # HTTP-клиент InSales API (GetAccount)
-  storage/            # SQLite-хранилище с миграциями
+  storage/            # SQLite-хранилище с inline-миграциями
   lifecycle/          # Сценарии install, login, autologin, uninstall
-  httpapp/            # HTTP-сервер, маршруты, middleware, шаблоны
+  httpapp/
+    templates/        # HTML-шаблоны (dashboard, error, install_ok) — embedded
   testutil/           # Симулятор платформы для тестов
-templates/            # HTML-шаблоны (dashboard, error, install_ok)
-migrations/           # Версионированные SQL-миграции (embedded)
 .github/workflows/    # CI и Security workflow
 ```
 
@@ -164,8 +165,9 @@ func (c *Client) GetOrders(ctx context.Context) ([]Order, error) {
 
 ### Добавление страницы
 
-1. Создайте шаблон в `templates/`.
+1. Создайте шаблон в `internal/httpapp/templates/` (используется `go:embed templateFS`).
 2. Добавьте маршрут в `internal/httpapp/httpapp.go`.
+3. Пересоберите бинарник: `go build -o bin/server ./cmd/server`.
 
 ## Зависимости
 

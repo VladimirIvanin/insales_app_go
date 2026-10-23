@@ -5,7 +5,7 @@ package testutil
 import (
 	"bytes"
 	"context"
-	"crypto/md5" //nolint:gosec // Required for InSales protocol compatibility in simulator
+	"crypto/md5" //nosec G501 // Required for InSales protocol compatibility in simulator
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -131,7 +131,7 @@ func (ps *PlatformSimulator) ShopURL() string {
 
 // InstallPassword computes the password for a given token.
 func (ps *PlatformSimulator) InstallPassword(token string) string {
-	h := md5.New() //nolint:gosec // Required for InSales protocol compatibility
+	h := md5.New() //nosec G401 // Required for InSales protocol compatibility
 	h.Write([]byte(token))
 	h.Write([]byte(ps.appSecret))
 	return fmt.Sprintf("%x", h.Sum(nil))
@@ -238,7 +238,7 @@ func (ps *PlatformSimulator) CompleteLogin(callbackURL, nonce, password string,
 }
 
 func (ps *PlatformSimulator) computeToken3(nonce, email, name, userID, emailConfirmed, password string) string {
-	h := md5.New() //nolint:gosec // Required for InSales protocol compatibility
+	h := md5.New() //nosec G401 // Required for InSales protocol compatibility
 	h.Write([]byte(nonce))
 	h.Write([]byte(email))
 	h.Write([]byte(name))

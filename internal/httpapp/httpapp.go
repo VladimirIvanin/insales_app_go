@@ -119,8 +119,8 @@ func (a *App) Handler() http.Handler {
 
 // verificationWorker processes candidate verifications in background.
 // Reads candidates from the storage queue, retries on failure with backoff
-// managed by ClaimCandidate/FailCandidate, and sleeps between poll cycles
-// so unprocessed candidates are picked up again after their next_attempt_at.
+// managed by ClaimCandidate/FailCandidate, and periodically polls for
+// candidates whose next_attempt_at has elapsed.
 func (a *App) verificationWorker() {
 	ctx := context.Background()
 
@@ -163,9 +163,24 @@ func (a *App) verificationWorker() {
 	// Initial poll on startup (catches candidates from before restart)
 	poll()
 
-	// Then wait for signals
-	for range a.verifyCh {
-		poll()
+	// Periodic poll — catches candidates whose next_attempt_at has elapsed
+	// even when no new install signal arrives.
+	pollTicker := time.NewTicker(30 * time.Second)
+	defer pollTicker.Stop()
+
+	// Periodic cleanup of expired sessions and challenges (every 5 minutes)
+	cleanupTicker := time.NewTicker(5 * time.Minute)
+	defer cleanupTicker.Stop()
+
+	for {
+		select {
+		case <-a.verifyCh:
+			poll()
+		case <-pollTicker.C:
+			poll()
+		case <-cleanupTicker.C:
+			a.storeDB.CleanupExpired()
+		}
 	}
 }
 
@@ -545,7 +560,7 @@ func (a *App) handleProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := insales.NewStrictClient("https://"+store.Shop, a.cfg.AppID, store.Password)
+	client := a.lifecycle.NewClient("https://"+store.Shop, store.Password)
 	account, err := client.GetAccount(r.Context())
 	if err != nil {
 		data := DashboardData{

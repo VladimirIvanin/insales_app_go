@@ -357,7 +357,7 @@ func TestSessionExpiry(t *testing.T) {
 
 	// Create session with short TTL
 	sessionID := "sess-exp"
-	if err := db.CreateSession(sessionID, 1, "user", 1, 1*time.Hour); err != nil {
+	if err := db.CreateSession(sessionID, 1, "user", 1, 1, 1*time.Hour); err != nil {
 		t.Fatal(err)
 	}
 

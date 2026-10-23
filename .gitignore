@@ -8,3 +8,4 @@ runtime/
 /coverage.out
 .gigacode/
 .agents/
+/server

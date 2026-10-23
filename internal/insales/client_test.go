@@ -225,9 +225,10 @@ func TestValidateShopURL(t *testing.T) {
 		err     bool
 	}{
 		{"shop.myinsales.ru", []string{"myinsales.ru"}, "https://shop.myinsales.ru", false},
-		{"https://shop.myinsales.ru", nil, "https://shop.myinsales.ru", false},
-		{"http://shop.myinsales.ru", nil, "https://shop.myinsales.ru", false},
-		{"", nil, "", true},
+		{"https://shop.myinsales.ru", []string{"myinsales.ru"}, "https://shop.myinsales.ru", false},
+		{"http://shop.myinsales.ru", []string{"myinsales.ru"}, "https://shop.myinsales.ru", false},
+		{"", []string{"myinsales.ru"}, "", true},
+		{"shop.myinsales.ru", nil, "", true}, // empty allowlist = refused
 		{"unknown.com", []string{"myinsales.ru"}, "", true},
 		{"shop.myinsales.ru", []string{"shop.myinsales.ru"}, "https://shop.myinsales.ru", false},
 		{"sub.shop.myinsales.ru", []string{"myinsales.ru"}, "https://sub.shop.myinsales.ru", false},

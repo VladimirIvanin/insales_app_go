@@ -67,6 +67,12 @@ func (s *Service) SetClientFactory(f func(shop, password string) *insales.Client
 	s.newClient = f
 }
 
+// NewClient creates a new InSales API client for the given shop and password
+// using the configured client factory (which can be replaced in tests).
+func (s *Service) NewClient(shop, password string) *insales.Client {
+	return s.newClient(shop, password)
+}
+
 // InstallParams holds the parameters from the InSales install callback.
 type InstallParams struct {
 	Shop      string
@@ -273,9 +279,9 @@ func (s *Service) HandleAutologin(ctx context.Context, params AutologinParams) (
 		return nil, ErrInvalidSignature
 	}
 
-	// Create session
+	// Create session with installation_epoch to bind it to this installation
 	sessionID := randomHex(32)
-	if err := s.store.CreateSession(sessionID, challenge.StoreID, params.UserID, store.Generation, SessionTTL); err != nil {
+	if err := s.store.CreateSession(sessionID, challenge.StoreID, params.UserID, store.Generation, store.InstallationEpoch, SessionTTL); err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 
@@ -287,7 +293,9 @@ func (s *Service) HandleAutologin(ctx context.Context, params AutologinParams) (
 }
 
 // VerifySession checks that a session is valid and returns the associated store.
-// It also verifies that the store's generation matches (hasn't been reinstalled).
+// It also verifies that both the store's generation and installation_epoch
+// match the session — the epoch check prevents cross-installation session reuse
+// after uninstall + reinstall.
 func (s *Service) VerifySession(sessionID string) (*storage.Session, *storage.Store, error) {
 	sess, err := s.store.GetSession(sessionID)
 	if err != nil {
@@ -301,6 +309,13 @@ func (s *Service) VerifySession(sessionID string) (*storage.Session, *storage.St
 
 	// Check generation match (store hasn't been reinstalled)
 	if sess.Generation != store.Generation {
+		return nil, nil, ErrExpired
+	}
+
+	// Check installation_epoch match — prevents a session created under a previous
+	// installation from being reused after uninstall+reinstall (which resets
+	// generation to 1 but increments installation_epoch).
+	if sess.InstallationEpoch != store.InstallationEpoch {
 		return nil, nil, ErrExpired
 	}
 

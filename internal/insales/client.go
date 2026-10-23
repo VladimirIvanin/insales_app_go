@@ -118,7 +118,10 @@ func (c *Client) GetAccount(ctx context.Context) (*Account, error) {
 // ValidateShopURL checks that the shop URL is valid and allowed.
 // Returns the normalized HTTPS URL or an error.
 // Only trusts the parsed hostname — rejects userinfo, path, fragment, and empty host.
-// An empty allowed list means any valid InSales shop domain is permitted.
+// An empty allowed list is refused by default — the operator MUST configure
+// at least one allowed domain. This prevents an attacker from pointing their
+// own HTTPS server at the install/login/uninstall endpoints and passing
+// account.id checks with a synthetic InSales-compatible response.
 func ValidateShopURL(shop string, allowed []string) (string, error) {
 	if shop == "" {
 		return "", fmt.Errorf("shop is empty")
@@ -164,18 +167,19 @@ func ValidateShopURL(shop string, allowed []string) (string, error) {
 		return "", fmt.Errorf("shop %q is not a valid domain", hostname)
 	}
 
-	// Check allowed shops list
-	if len(allowed) > 0 {
-		matched := false
-		for _, a := range allowed {
-			if hostname == a || strings.HasSuffix(hostname, "."+a) {
-				matched = true
-				break
-			}
+	// Check allowed shops list — MUST be non-empty, no wildcard.
+	if len(allowed) == 0 {
+		return "", fmt.Errorf("ALLOWED_SHOPS is empty: at least one shop domain must be configured (security)")
+	}
+	matched := false
+	for _, a := range allowed {
+		if hostname == a || strings.HasSuffix(hostname, "."+a) {
+			matched = true
+			break
 		}
-		if !matched {
-			return "", fmt.Errorf("shop %q is not in the allowed list", hostname)
-		}
+	}
+	if !matched {
+		return "", fmt.Errorf("shop %q is not in the allowed list", hostname)
 	}
 
 	return "https://" + hostname, nil

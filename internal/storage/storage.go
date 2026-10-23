@@ -35,21 +35,23 @@ var (
 
 // Store represents an installed shop.
 type Store struct {
-	ID         int    // insales_id
-	Shop       string // canonical shop domain
-	Password   string // encrypted install password
-	Title      string // shop title from API
-	Generation int64  // monotonic generation counter
-	CreatedAt  time.Time
+	ID                int    // insales_id
+	Shop              string // canonical shop domain
+	Password          string // encrypted install password
+	Title             string // shop title from API
+	Generation        int64  // monotonic generation counter for credential rotation
+	InstallationEpoch int64  // monotonic epoch, never reset — prevents cross-installation session reuse
+	CreatedAt         time.Time
 }
 
 // Session represents an authenticated browser session.
 type Session struct {
-	ID         string
-	StoreID    int
-	UserID     string
-	Generation int64
-	ExpiresAt  time.Time
+	ID                string
+	StoreID           int
+	UserID            string
+	Generation        int64
+	InstallationEpoch int64
+	ExpiresAt         time.Time
 }
 
 // Challenge represents a one-time login nonce.
@@ -203,6 +205,14 @@ func (s *DB) runMigrations() error {
 				CREATE INDEX IF NOT EXISTS idx_challenges_store ON challenges(store_id);
 			`,
 		},
+		{
+			version: 2,
+			sql: `
+				ALTER TABLE stores ADD COLUMN installation_epoch INTEGER NOT NULL DEFAULT 1;
+				ALTER TABLE sessions ADD COLUMN installation_epoch INTEGER NOT NULL DEFAULT 1;
+				CREATE INDEX IF NOT EXISTS idx_stores_epoch ON stores(installation_epoch);
+			`,
+		},
 	}
 
 	for _, m := range migrations {
@@ -269,10 +279,20 @@ func (s *DB) decrypt(cipherHex string) ([]byte, error) {
 // --- Store operations ---
 
 // CreateCandidate saves a pending installation candidate.
+// Returns ErrAlreadyExists if a candidate with the same ID already exists.
 func (s *DB) CreateCandidate(c *Candidate) error {
 	passEnc, err := s.encrypt([]byte(c.Password))
 	if err != nil {
 		return err
+	}
+
+	// Enforce per-store candidate limit
+	var storeCount int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM candidates WHERE store_id = ?", c.StoreID).Scan(&storeCount); err != nil {
+		return fmt.Errorf("count candidates: %w", err)
+	}
+	if storeCount >= 5 {
+		return fmt.Errorf("too many pending candidates for store %d (max 5)", c.StoreID)
 	}
 
 	_, err = s.db.Exec(`
@@ -287,6 +307,7 @@ func (s *DB) CreateCandidate(c *Candidate) error {
 
 // CreateCandidateAtomic atomically reserves the next generation and inserts a candidate.
 // Uses a transaction to prevent race conditions on generation assignment.
+// Enforces per-store and global candidate limits.
 func (s *DB) CreateCandidateAtomic(c *Candidate) error {
 	passEnc, err := s.encrypt([]byte(c.Password))
 	if err != nil {
@@ -298,6 +319,24 @@ func (s *DB) CreateCandidateAtomic(c *Candidate) error {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Enforce per-store candidate limit
+	var storeCount int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM candidates WHERE store_id = ?", c.StoreID).Scan(&storeCount); err != nil {
+		return fmt.Errorf("count candidates: %w", err)
+	}
+	if storeCount >= 5 {
+		return fmt.Errorf("too many pending candidates for store %d (max 5)", c.StoreID)
+	}
+
+	// Enforce global candidate limit
+	var globalCount int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM candidates").Scan(&globalCount); err != nil {
+		return fmt.Errorf("count global candidates: %w", err)
+	}
+	if globalCount >= 100 {
+		return fmt.Errorf("too many pending candidates globally (max 100)")
+	}
 
 	// Atomically determine next generation under lock
 	var gen int64
@@ -486,17 +525,26 @@ func (s *DB) PromoteCandidate(candidateID string, title string) (bool, error) {
 		return false, nil
 	}
 
-	// Upsert store
+	// Upsert store — increment installation_epoch on reinstall to prevent
+	// cross-installation session reuse.
+	var currentEpoch int64
+	err = tx.QueryRow("SELECT COALESCE(MAX(installation_epoch), 0) FROM stores WHERE id = ?", c.storeID).Scan(&currentEpoch)
+	if err != nil {
+		return false, fmt.Errorf("check current epoch: %w", err)
+	}
+	newEpoch := currentEpoch + 1
+
 	_, err = tx.Exec(`
-		INSERT INTO stores (id, shop, password, title, generation, created_at)
-		VALUES (?, ?, ?, ?, ?, datetime('now'))
+		INSERT INTO stores (id, shop, password, title, generation, installation_epoch, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
 		ON CONFLICT(id) DO UPDATE SET
 			shop = excluded.shop,
 			password = excluded.password,
 			title = excluded.title,
 			generation = excluded.generation,
+			installation_epoch = excluded.installation_epoch,
 			created_at = datetime('now')
-	`, c.storeID, c.shop, c.passEnc, title, c.generation)
+	`, c.storeID, c.shop, c.passEnc, title, c.generation, newEpoch)
 	if err != nil {
 		return false, fmt.Errorf("upsert store: %w", err)
 	}
@@ -523,9 +571,9 @@ func (s *DB) GetActiveStore(storeID int) (*Store, error) {
 	var passEnc string
 	var createdAtStr string
 	err := s.db.QueryRow(`
-		SELECT id, shop, password, title, generation, created_at
+		SELECT id, shop, password, title, generation, installation_epoch, created_at
 		FROM stores WHERE id = ?
-	`, storeID).Scan(&store.ID, &store.Shop, &passEnc, &store.Title, &store.Generation, &createdAtStr)
+	`, storeID).Scan(&store.ID, &store.Shop, &passEnc, &store.Title, &store.Generation, &store.InstallationEpoch, &createdAtStr)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -549,9 +597,9 @@ func (s *DB) GetStoreByShop(shop string) (*Store, error) {
 	var passEnc string
 	var createdAtStr string
 	err := s.db.QueryRow(`
-		SELECT id, shop, password, title, generation, created_at
+		SELECT id, shop, password, title, generation, installation_epoch, created_at
 		FROM stores WHERE shop = ?
-	`, shop).Scan(&store.ID, &store.Shop, &passEnc, &store.Title, &store.Generation, &createdAtStr)
+	`, shop).Scan(&store.ID, &store.Shop, &passEnc, &store.Title, &store.Generation, &store.InstallationEpoch, &createdAtStr)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -569,84 +617,121 @@ func (s *DB) GetStoreByShop(shop string) (*Store, error) {
 	return &store, nil
 }
 
-// UninstallStore removes a store and all its related data in a single transaction.
-// It verifies the password against the active store or any candidate with matching store_id.
-// Returns (removed, error). removed=false means nothing found (idempotent).
+// UninstallStore removes a store and all its related data in a single write-transaction.
+//
+// It verifies the password against the ACTIVE store first (full removal of store +
+// sessions + challenges + candidates). If the password matches a CANDIDATE instead
+// (pending verification), only that candidate and its matching store data are removed.
+//
+// The entire check and deletion happens atomically inside one write-transaction,
+// preventing TOCTOU races (finding #4). Blanket delete by store_id is only performed
+// when the active credential matches (fixing #5). All candidates are scanned for a
+// password match, not just the latest (fixing #6).
+//
+// Returns (removed, error). removed=false with nil error means nothing found (idempotent).
 func (s *DB) UninstallStore(storeID int, password string) (bool, error) {
-	// Check active store first
-	store, err := s.GetActiveStore(storeID)
-	if err != nil && err != ErrNotFound {
-		return false, fmt.Errorf("get store: %w", err)
-	}
-
-	passwordOK := store != nil && subtle.ConstantTimeCompare([]byte(store.Password), []byte(password)) == 1
-
-	if !passwordOK {
-		// Check candidates table for a matching password
-		var candidatePassEnc string
-		err := s.db.QueryRow(`
-			SELECT password FROM candidates WHERE store_id = ?
-			ORDER BY generation DESC LIMIT 1
-		`, storeID).Scan(&candidatePassEnc)
-		if err == sql.ErrNoRows {
-			if store != nil {
-				// Active store exists but password doesn't match and no candidates
-				return false, ErrNotAuthorized
-			}
-			// Nothing found at all — idempotent
-			return false, nil
-		}
-		if err != nil {
-			return false, fmt.Errorf("check candidates: %w", err)
-		}
-
-		plainPass, err := s.decrypt(candidatePassEnc)
-		if err != nil {
-			return false, fmt.Errorf("decrypt candidate password: %w", err)
-		}
-		if subtle.ConstantTimeCompare(plainPass, []byte(password)) != 1 {
-			return false, ErrNotAuthorized
-		}
-	}
-
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Cancel all candidates for this store
-	if _, err := tx.Exec("DELETE FROM candidates WHERE store_id = ?", storeID); err != nil {
-		return false, fmt.Errorf("delete candidates: %w", err)
+	// 1. Check active store password inside transaction
+	var activePassEnc sql.NullString
+	err = tx.QueryRow("SELECT password FROM stores WHERE id = ?", storeID).Scan(&activePassEnc)
+	if err != nil && err != sql.ErrNoRows {
+		return false, fmt.Errorf("read active store password: %w", err)
 	}
 
-	// Delete challenges
-	if _, err := tx.Exec("DELETE FROM challenges WHERE store_id = ?", storeID); err != nil {
-		return false, fmt.Errorf("delete challenges: %w", err)
+	activeMatch := false
+	if activePassEnc.Valid {
+		plainPass, decErr := s.decrypt(activePassEnc.String)
+		if decErr != nil {
+			return false, fmt.Errorf("decrypt active password: %w", decErr)
+		}
+		if subtle.ConstantTimeCompare(plainPass, []byte(password)) == 1 {
+			activeMatch = true
+		}
 	}
 
-	// Delete sessions
-	if _, err := tx.Exec("DELETE FROM sessions WHERE store_id = ?", storeID); err != nil {
-		return false, fmt.Errorf("delete sessions: %w", err)
+	if activeMatch {
+		// Full uninstall — delete everything for this store
+		if _, err := tx.Exec("DELETE FROM candidates WHERE store_id = ?", storeID); err != nil {
+			return false, fmt.Errorf("delete candidates: %w", err)
+		}
+		if _, err := tx.Exec("DELETE FROM challenges WHERE store_id = ?", storeID); err != nil {
+			return false, fmt.Errorf("delete challenges: %w", err)
+		}
+		if _, err := tx.Exec("DELETE FROM sessions WHERE store_id = ?", storeID); err != nil {
+			return false, fmt.Errorf("delete sessions: %w", err)
+		}
+		if _, err := tx.Exec("DELETE FROM stores WHERE id = ?", storeID); err != nil {
+			return false, fmt.Errorf("delete store: %w", err)
+		}
+		return true, tx.Commit()
 	}
 
-	// Delete store
-	if _, err := tx.Exec("DELETE FROM stores WHERE id = ?", storeID); err != nil {
-		return false, fmt.Errorf("delete store: %w", err)
+	// 2. Check all candidates for a password match (not just the latest generation)
+	var candidateIDs []string
+	var hadCandidates bool
+	rows, err := tx.Query("SELECT id, password FROM candidates WHERE store_id = ?", storeID)
+	if err != nil {
+		return false, fmt.Errorf("read candidates: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		hadCandidates = true
+		var cID, cPassEnc string
+		if err := rows.Scan(&cID, &cPassEnc); err != nil {
+			return false, fmt.Errorf("scan candidate: %w", err)
+		}
+		plainPass, decErr := s.decrypt(cPassEnc)
+		if decErr != nil {
+			return false, fmt.Errorf("decrypt candidate password: %w", decErr)
+		}
+		if subtle.ConstantTimeCompare(plainPass, []byte(password)) == 1 {
+			candidateIDs = append(candidateIDs, cID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("rows iteration: %w", err)
 	}
 
-	return true, tx.Commit()
+	if len(candidateIDs) > 0 {
+		// Cancel matching candidates only — do NOT touch active store or other credentials
+		for _, cid := range candidateIDs {
+			if _, err := tx.Exec("DELETE FROM candidates WHERE id = ?", cid); err != nil {
+				return false, fmt.Errorf("delete candidate %s: %w", cid, err)
+			}
+		}
+		return true, tx.Commit()
+	}
+
+	// 3. Nothing matched
+	if activePassEnc.Valid {
+		// Active store exists but wrong password, no matching candidates
+		return false, ErrNotAuthorized
+	}
+
+	if hadCandidates {
+		// Candidates exist but none matched the password
+		return false, ErrNotAuthorized
+	}
+
+	// No store, no candidates — idempotent
+	return false, nil
 }
 
 // --- Session operations ---
 
 // CreateSession creates a new browser session.
-func (s *DB) CreateSession(id string, storeID int, userID string, generation int64, ttl time.Duration) error {
+func (s *DB) CreateSession(id string, storeID int, userID string, generation int64, installationEpoch int64, ttl time.Duration) error {
 	expires := s.now().Add(ttl)
 	_, err := s.db.Exec(`
-		INSERT INTO sessions (id, store_id, user_id, generation, expires_at, created_at)
-		VALUES (?, ?, ?, ?, ?, datetime('now'))
-	`, id, storeID, userID, generation, expires.Format(time.RFC3339))
+		INSERT INTO sessions (id, store_id, user_id, generation, installation_epoch, expires_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+	`, id, storeID, userID, generation, installationEpoch, expires.Format(time.RFC3339))
 	return err
 }
 
@@ -655,10 +740,10 @@ func (s *DB) GetSession(id string) (*Session, error) {
 	var sess Session
 	var expiresStr string
 	err := s.db.QueryRow(`
-		SELECT s.id, s.store_id, s.user_id, s.generation, s.expires_at
+		SELECT s.id, s.store_id, s.user_id, s.generation, s.installation_epoch, s.expires_at
 		FROM sessions s
 		WHERE s.id = ?
-	`, id).Scan(&sess.ID, &sess.StoreID, &sess.UserID, &sess.Generation, &expiresStr)
+	`, id).Scan(&sess.ID, &sess.StoreID, &sess.UserID, &sess.Generation, &sess.InstallationEpoch, &expiresStr)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -733,7 +818,12 @@ func (s *DB) ConsumeChallenge(id string, browserID string) (*Challenge, error) {
 
 	// Check expiry
 	if s.now().After(ch.ExpiresAt) {
-		tx.Exec("DELETE FROM challenges WHERE id = ?", id)
+		if _, err := tx.Exec("DELETE FROM challenges WHERE id = ?", id); err != nil {
+			return nil, fmt.Errorf("delete expired challenge: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit delete expired challenge: %w", err)
+		}
 		return nil, ErrNotFound
 	}
 
