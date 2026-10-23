@@ -30,7 +30,7 @@ This project implements the following security measures:
 5. **Input Validation**:
    - Shop URLs are parsed with `net/url.Parse` and validated against the parsed `Hostname` only. Userinfo, path, fragment, and query parameters are rejected.
    - Duplicate query parameters on install/uninstall are rejected.
-   - Shop domain is checked against an explicit allowlist when `ALLOWED_SHOPS` is configured. An empty allowlist permits any valid InSales shop domain.
+   - Shop domain is checked against an explicit allowlist when `ALLOWED_SHOPS` is configured. An empty allowlist (`ALLOWED_SHOPS=""`) **permits any valid InSales shop domain** — anyone who knows your app's install URL can install it. In production, always configure `ALLOWED_SHOPS` with one or more specific shop domains.
    - IP addresses are rejected as shop domains.
    - `insales_id` is parsed with `strconv.Atoi` (full-string, not partial).
 6. **No Secrets in Logs**: Passwords, tokens, and full callback query strings are not logged.
@@ -39,16 +39,16 @@ This project implements the following security measures:
 9. **Dependency Scanning**: GitHub Actions run `govulncheck` and `gosec` on every push and PR.
 10. **Dependabot**: Automated dependency updates for Go modules and GitHub Actions.
 11. **SQLite Hardening**:
-    - WAL journal mode with `busy_timeout=5000`.
-    - `SetMaxOpenConns(1)` to prevent concurrent write conflicts.
-    - `PRAGMA foreign_keys = ON` is set in every transaction.
+    - WAL journal mode with `busy_timeout=5000` set via `PRAGMA` after opening the connection.
+    - `SetMaxOpenConns(1)` serialises all transactions within a single process, preventing concurrent write conflicts.
+    - `PRAGMA foreign_keys = ON` is set on the connection, not per-transaction.
 12. **Lifecycle Safety**:
-    - Candidate generation (generation counter) is reserved atomically within a transaction using `BEGIN IMMEDIATE`.
+    - Candidate generation (generation counter) is reserved atomically within a transaction.
     - Background verification worker reads from the database queue, not just an in-memory channel, so pending candidates survive restart.
-    - `ClaimCandidate` uses `BEGIN IMMEDIATE` with exponential backoff (10s, 30s, 90s) and unique lease tokens.
+    - `ClaimCandidate` uses exponential backoff (10s, 30s, 90s) and unique lease tokens.
     - Transient API errors (429, 5xx, transport) are recorded with `Retry-After` header value and re-scheduled.
     - Uninstall with a database error returns HTTP 500 so InSales retries the callback.
-    - Uninstall searches both `stores` and `candidates` tables for credentials.
+    - Uninstall searches both `stores` and `candidates` tables for credentials, verifying the password against the active store or any candidate.
 
 ## Scope
 

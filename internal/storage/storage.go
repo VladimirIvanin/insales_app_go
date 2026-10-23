@@ -83,10 +83,25 @@ type DB struct {
 }
 
 // New opens or creates a SQLite database, runs migrations, and returns a DB handle.
+// PRAGMA settings (WAL, busy_timeout, foreign_keys) are applied via Exec after open,
+// because modernc.org/sqlite does not honour DSN query parameters.
 func New(dbPath string, encryptionKey []byte) (*DB, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
+	}
+
+	// Apply PRAGMA settings at runtime — DSN parameters are not supported by modernc.org/sqlite.
+	pragmas := []string{
+		"PRAGMA journal_mode = WAL",
+		"PRAGMA busy_timeout = 5000",
+		"PRAGMA foreign_keys = ON",
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("pragma %q: %w", p, err)
+		}
 	}
 
 	// Create AES-GCM cipher for password encryption
@@ -271,7 +286,7 @@ func (s *DB) CreateCandidate(c *Candidate) error {
 }
 
 // CreateCandidateAtomic atomically reserves the next generation and inserts a candidate.
-// Uses BEGIN IMMEDIATE to prevent race conditions on generation assignment.
+// Uses a transaction to prevent race conditions on generation assignment.
 func (s *DB) CreateCandidateAtomic(c *Candidate) error {
 	passEnc, err := s.encrypt([]byte(c.Password))
 	if err != nil {
@@ -283,10 +298,6 @@ func (s *DB) CreateCandidateAtomic(c *Candidate) error {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	if _, err := tx.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		return fmt.Errorf("pragma: %w", err)
-	}
 
 	// Atomically determine next generation under lock
 	var gen int64
@@ -316,7 +327,7 @@ func (s *DB) CreateCandidateAtomic(c *Candidate) error {
 }
 
 // ClaimCandidate atomically claims a candidate for verification.
-// Uses BEGIN IMMEDIATE to prevent concurrent claims.
+// Uses a transaction to prevent concurrent claims.
 // Sets a lease token and next_attempt_at for retry/backoff.
 // If no candidate is available, returns nil, nil.
 func (s *DB) ClaimCandidate() (*Candidate, error) {
@@ -325,10 +336,6 @@ func (s *DB) ClaimCandidate() (*Candidate, error) {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	if _, err := tx.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		return nil, fmt.Errorf("pragma: %w", err)
-	}
 
 	// Pick the next candidate with attempts remaining and lease expired
 	row := tx.QueryRow(`
@@ -563,32 +570,42 @@ func (s *DB) GetStoreByShop(shop string) (*Store, error) {
 }
 
 // UninstallStore removes a store and all its related data in a single transaction.
-// It verifies the password before proceeding.
-// Looks up credentials in both stores and candidates tables.
-// Returns (removed, error). removed=false means store not found or wrong password (idempotent).
+// It verifies the password against the active store or any candidate with matching store_id.
+// Returns (removed, error). removed=false means nothing found (idempotent).
 func (s *DB) UninstallStore(storeID int, password string) (bool, error) {
-	// Verify password exists in stores table
+	// Check active store first
 	store, err := s.GetActiveStore(storeID)
 	if err != nil && err != ErrNotFound {
 		return false, fmt.Errorf("get store: %w", err)
 	}
 
-	if store != nil {
-		// Password must match using constant-time comparison
-		if subtle.ConstantTimeCompare([]byte(store.Password), []byte(password)) != 1 {
-			return false, ErrNotAuthorized
-		}
-	}
+	passwordOK := store != nil && subtle.ConstantTimeCompare([]byte(store.Password), []byte(password)) == 1
 
-	// If store not found, check candidates
-	if store == nil {
-		var count int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM candidates WHERE store_id = ?", storeID).Scan(&count)
+	if !passwordOK {
+		// Check candidates table for a matching password
+		var candidatePassEnc string
+		err := s.db.QueryRow(`
+			SELECT password FROM candidates WHERE store_id = ?
+			ORDER BY generation DESC LIMIT 1
+		`, storeID).Scan(&candidatePassEnc)
+		if err == sql.ErrNoRows {
+			if store != nil {
+				// Active store exists but password doesn't match and no candidates
+				return false, ErrNotAuthorized
+			}
+			// Nothing found at all — idempotent
+			return false, nil
+		}
 		if err != nil {
 			return false, fmt.Errorf("check candidates: %w", err)
 		}
-		if count == 0 {
-			return false, nil // nothing to do, idempotent
+
+		plainPass, err := s.decrypt(candidatePassEnc)
+		if err != nil {
+			return false, fmt.Errorf("decrypt candidate password: %w", err)
+		}
+		if subtle.ConstantTimeCompare(plainPass, []byte(password)) != 1 {
+			return false, ErrNotAuthorized
 		}
 	}
 
@@ -614,15 +631,8 @@ func (s *DB) UninstallStore(storeID int, password string) (bool, error) {
 	}
 
 	// Delete store
-	result, err := tx.Exec("DELETE FROM stores WHERE id = ?", storeID)
-	if err != nil {
+	if _, err := tx.Exec("DELETE FROM stores WHERE id = ?", storeID); err != nil {
 		return false, fmt.Errorf("delete store: %w", err)
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		// Only candidates existed (pending install)
-		return true, tx.Commit()
 	}
 
 	return true, tx.Commit()

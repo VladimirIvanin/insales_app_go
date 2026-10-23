@@ -19,9 +19,9 @@ type (
 
 	// APIError represents an unexpected HTTP status from the InSales API.
 	APIError struct {
-		Status      int
-		Body        string
-		RetryAfter  int // seconds, from Retry-After header
+		Status     int
+		Body       string
+		RetryAfter int // seconds, from Retry-After header
 	}
 
 	// ResourceError represents a malformed response (invalid JSON, wrong shape).

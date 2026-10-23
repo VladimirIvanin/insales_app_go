@@ -6,3 +6,5 @@ runtime/
 *.db-shm
 /tmp/
 /coverage.out
+.gigacode/
+.agents/

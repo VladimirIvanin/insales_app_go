@@ -172,13 +172,6 @@ func (c *Client) GetOrders(ctx context.Context) ([]Order, error) {
 - Стандартная библиотека Go (net/http, html/template, database/sql, crypto/*, log/slog)
 - `modernc.org/sqlite` — pure-Go SQLite (без CGO)
 
-## Ревизии использованных примеров
-
-- [Оригинальное приложение InSales на Ruby](https://github.com/insales/insales_app) — revision `78593a409e8e838c2567c5645c4354e36f879a24`
-- [Заготовка на Python](https://github.com/VladimirIvanin/insales_app_python) — revision изучена для протокола
-- [Заготовка на PHP](https://github.com/VladimirIvanin/insales_app_php) — revision изучена для архитектуры
-- [Python-demo в поставке skill](.gigacode/skills/insales-partner-app-expert/assets/python-demo/) — протокол и тестовые сценарии
-
 ## Лицензия
 
 MIT

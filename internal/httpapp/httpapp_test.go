@@ -69,7 +69,7 @@ type testFixture struct {
 
 // frozenClock provides a controllable time source for tests.
 type frozenClock struct {
-	mu    sync.Mutex
+	mu   sync.Mutex
 	time time.Time
 }
 
@@ -832,7 +832,7 @@ func TestUninstallTwice(t *testing.T) {
 }
 
 // TestUninstallWrongPassword verifies that uninstall with wrong password
-// still returns 200 per InSales protocol.
+// returns 403.
 func TestUninstallWrongPassword(t *testing.T) {
 	fx, srv := newFixture(t)
 
@@ -845,9 +845,8 @@ func TestUninstallWrongPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sim.Uninstall: %v", err)
 	}
-	// Per InSales protocol, always return 200
-	if status != http.StatusOK {
-		t.Errorf("uninstall with wrong password: status = %d, want %d", status, http.StatusOK)
+	if status != http.StatusForbidden {
+		t.Errorf("uninstall with wrong password: status = %d, want %d", status, http.StatusForbidden)
 	}
 
 	// Store should still be intact
@@ -1029,5 +1028,69 @@ func TestLoginForUninstalledStore(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		body, _ := io.ReadAll(resp.Body)
 		t.Errorf("status = %d, body = %s, want 404", resp.StatusCode, string(body))
+	}
+}
+
+// TestProbeWithoutSession tests that POST /probe without a session returns 401.
+func TestProbeWithoutSession(t *testing.T) {
+	_, srv := newFixture(t)
+
+	resp, err := http.Post(srv.URL+"/probe", "text/plain", nil) //nolint:noctx
+	if err != nil {
+		t.Fatalf("POST /probe: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, body = %s, want 401", resp.StatusCode, string(body))
+	}
+}
+
+// TestProbeWithSession tests that POST /probe with a valid session returns
+// the dashboard with probe result (success or error).
+func TestProbeWithSession(t *testing.T) {
+	fx, srv := newFixture(t)
+
+	shop := sharedTestShop(42)
+	installStore(t, fx, srv, shop, 42)
+
+	sessionID := loginAndGetSession(t, fx, srv, shop, 42)
+
+	// POST /probe with session cookie
+	req, _ := http.NewRequest("POST", srv.URL+"/probe", nil)
+	req.AddCookie(&http.Cookie{Name: "session_id", Value: sessionID})
+
+	client := noRedirectClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST /probe: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("probe status = %d, body = %s, want 200", resp.StatusCode, string(body))
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "API") {
+		t.Errorf("probe body does not contain API result: %s", string(body))
+	}
+}
+
+// TestProbeMethodNotAllowed tests that GET /probe returns 405.
+func TestProbeMethodNotAllowed(t *testing.T) {
+	_, srv := newFixture(t)
+
+	resp, err := http.Get(srv.URL + "/probe") //nolint:noctx
+	if err != nil {
+		t.Fatalf("GET /probe: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, body = %s, want 405", resp.StatusCode, string(body))
 	}
 }

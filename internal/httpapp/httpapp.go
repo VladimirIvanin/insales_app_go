@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"html"
 	"html/template"
@@ -117,8 +118,9 @@ func (a *App) Handler() http.Handler {
 }
 
 // verificationWorker processes candidate verifications in background.
-// Reads candidates from the queue (storage) rather than relying only on the channel,
-// so after restart unprocessed candidates are still picked up.
+// Reads candidates from the storage queue, retries on failure with backoff
+// managed by ClaimCandidate/FailCandidate, and sleeps between poll cycles
+// so unprocessed candidates are picked up again after their next_attempt_at.
 func (a *App) verificationWorker() {
 	ctx := context.Background()
 
@@ -137,21 +139,21 @@ func (a *App) verificationWorker() {
 
 			err = a.lifecycle.VerifyInstall(ctx, candidate)
 			if err != nil {
-				// Determine retry delay
+				// Determine retry delay from error type
 				retryAfter := 30
-				var apiErr *insales.APIError
 				if insales.IsTransientError(err) {
 					retryAfter = 10
 				}
-				if apiErr != nil && apiErr.RetryAfter > 0 {
+				var apiErr *insales.APIError
+				if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
 					retryAfter = apiErr.RetryAfter
 				}
 
-				if err := a.storeDB.FailCandidate(candidate.ID, err.Error(), retryAfter); err != nil {
-					slog.Error("fail candidate", "candidate", candidate.ID, "error", err)
+				if failErr := a.storeDB.FailCandidate(candidate.ID, err.Error(), retryAfter); failErr != nil {
+					slog.Error("fail candidate", "candidate", candidate.ID, "error", failErr)
 				}
-				slog.Warn("verification failed", "store", candidate.StoreID, "error", err)
-				return
+				slog.Warn("verification failed, will retry", "store", candidate.StoreID, "retryAfter", retryAfter, "error", err)
+				continue
 			}
 
 			slog.Info("verification succeeded", "store", candidate.StoreID, "shop", candidate.Shop)
@@ -632,12 +634,14 @@ func (a *App) handleUninstall(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == lifecycle.ErrForbidden {
 		slog.Warn("uninstall: wrong password", "shop", shop)
-		// Still 200 per InSales protocol — wrong password means someone else tried
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("Forbidden"))
+		return
 	}
 
 	slog.Info("uninstall processed", "shop", shop, "insales_id", insalesID)
 
-	// Always return 200 per InSales protocol
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))

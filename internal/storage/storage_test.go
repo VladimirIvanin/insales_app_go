@@ -217,6 +217,103 @@ func TestUninstallWrongPassword(t *testing.T) {
 	}
 }
 
+func TestUninstallViaCandidate(t *testing.T) {
+	db := newTestDB(t)
+
+	// Only a candidate exists (no active store) with correct password
+	c := &storage.Candidate{
+		ID:          "cand-1",
+		StoreID:     1,
+		Shop:        "candidate-shop.myinsales.ru",
+		Password:    "candidate-pass",
+		Generation:  1,
+		MaxAttempts: 3,
+	}
+	db.CreateCandidate(c)
+
+	ok, err := db.UninstallStore(1, "candidate-pass")
+	if err != nil {
+		t.Fatalf("UninstallStore via candidate: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected uninstall via candidate to succeed")
+	}
+}
+
+func TestUninstallViaCandidateWrongPassword(t *testing.T) {
+	db := newTestDB(t)
+
+	c := &storage.Candidate{
+		ID:          "cand-1",
+		StoreID:     1,
+		Shop:        "candidate-shop.myinsales.ru",
+		Password:    "correct-candidate-pass",
+		Generation:  1,
+		MaxAttempts: 3,
+	}
+	db.CreateCandidate(c)
+
+	_, err := db.UninstallStore(1, "wrong-password")
+	if err != storage.ErrNotAuthorized {
+		t.Fatalf("expected ErrNotAuthorized for candidate wrong password, got %v", err)
+	}
+}
+
+func TestUninstallStorePasswordMismatchButCandidateMatches(t *testing.T) {
+	db := newTestDB(t)
+
+	// Active store with password-1
+	c1 := &storage.Candidate{
+		ID:          "cand-1",
+		StoreID:     1,
+		Shop:        "shop.myinsales.ru",
+		Password:    "password-1",
+		Generation:  1,
+		MaxAttempts: 3,
+	}
+	db.CreateCandidate(c1)
+	db.PromoteCandidate("cand-1", "Shop")
+
+	// Candidate with password-2 (e.g. reinstall in progress)
+	c2 := &storage.Candidate{
+		ID:          "cand-2",
+		StoreID:     1,
+		Shop:        "shop.myinsales.ru",
+		Password:    "password-2",
+		Generation:  2,
+		MaxAttempts: 3,
+	}
+	db.CreateCandidate(c2)
+
+	// Uninstall with password-2 (the candidate's password, not the active store's)
+	ok, err := db.UninstallStore(1, "password-2")
+	if err != nil {
+		t.Fatalf("UninstallStore: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected uninstall to succeed with candidate password")
+	}
+
+	// Both store and candidate should be gone
+	_, err = db.GetActiveStore(1)
+	if err != storage.ErrNotFound {
+		t.Fatal("expected store to be deleted")
+	}
+}
+
+func TestUninstallIdempotentNoData(t *testing.T) {
+	db := newTestDB(t)
+
+	// Nothing exists for this store
+	ok, err := db.UninstallStore(999, "whatever")
+	if err != nil {
+		t.Fatalf("UninstallStore on missing store: %v", err)
+	}
+	if ok {
+		t.Fatal("expected false for non-existent store")
+	}
+}
+
 func TestSessionCreateAndGet(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Now()
