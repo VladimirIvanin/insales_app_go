@@ -53,7 +53,7 @@ func main() {
 	dbDir := cfg.DBPath
 	if idx := strings.LastIndex(dbDir, "/"); idx >= 0 {
 		dir := dbDir[:idx]
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0750); err != nil {
 			slog.Error("cannot create db directory", "dir", dir, "error", err)
 			os.Exit(1)
 		}

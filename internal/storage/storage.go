@@ -101,7 +101,7 @@ func New(dbPath string, encryptionKey []byte) (*DB, error) {
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("pragma %q: %w", p, err)
 		}
 	}
@@ -231,12 +231,12 @@ func (s *DB) runMigrations() error {
 		}
 
 		if _, err := tx.Exec(m.sql); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return fmt.Errorf("apply migration %d: %w", m.version, err)
 		}
 
 		if _, err := tx.Exec("INSERT INTO schema_version (version) VALUES (?)", m.version); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return fmt.Errorf("record migration %d: %w", m.version, err)
 		}
 
@@ -757,8 +757,8 @@ func (s *DB) GetSession(id string) (*Session, error) {
 	}
 
 	if s.now().After(sess.ExpiresAt) {
-		// Clean up expired session
-		s.db.Exec("DELETE FROM sessions WHERE id = ?", id)
+		// Ошибку удаления не возвращаем: сессия уже истекла, повтор будет в CleanupExpired.
+		_, _ = s.db.Exec("DELETE FROM sessions WHERE id = ?", id)
 		return nil, ErrNotFound
 	}
 
@@ -872,8 +872,9 @@ func (s *DB) GetLastCandidateGeneration(storeID int) (int64, error) {
 // CleanupExpired removes expired sessions and challenges.
 func (s *DB) CleanupExpired() {
 	now := s.now().Format(time.RFC3339)
-	s.db.Exec("DELETE FROM sessions WHERE expires_at < ?", now)
-	s.db.Exec("DELETE FROM challenges WHERE expires_at < ?", now)
+	// Сбой очистки не останавливает воркер: строки будут подобраны на следующем цикле.
+	_, _ = s.db.Exec("DELETE FROM sessions WHERE expires_at < ?", now)
+	_, _ = s.db.Exec("DELETE FROM challenges WHERE expires_at < ?", now)
 }
 
 // HasStore checks if a store exists by ID.

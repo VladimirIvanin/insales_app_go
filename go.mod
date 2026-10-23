@@ -1,6 +1,8 @@
 module github.com/ivaninvladimir/insales_app_go
 
-go 1.23.0
+go 1.26.0
+
+toolchain go1.27.3
 
 require modernc.org/sqlite v1.34.5
 
@@ -11,7 +13,7 @@ require (
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/exp v0.0.0-20230315142452-642cacee5cc0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	modernc.org/libc v1.61.13 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.8.2 // indirect

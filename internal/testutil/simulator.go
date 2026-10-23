@@ -5,7 +5,7 @@ package testutil
 import (
 	"bytes"
 	"context"
-	"crypto/md5" //nosec G501 // Required for InSales protocol compatibility in simulator
+	"crypto/md5" // #nosec G501 -- Required for InSales protocol compatibility in simulator
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -104,7 +104,8 @@ func NewPlatformSimulator(appID, appSecret, installURL, callbackURL string) (*Pl
 	}
 
 	ps.server = &http.Server{
-		Handler: http.HandlerFunc(ps.handle),
+		Handler:           http.HandlerFunc(ps.handle),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	go ps.server.Serve(listener)
@@ -115,7 +116,7 @@ func NewPlatformSimulator(appID, appSecret, installURL, callbackURL string) (*Pl
 // Close shuts down the simulator.
 func (ps *PlatformSimulator) Close() {
 	ps.closed.Store(true)
-	ps.server.Close()
+	_ = ps.server.Close()
 }
 
 // Port returns the listening port.
@@ -131,7 +132,7 @@ func (ps *PlatformSimulator) ShopURL() string {
 
 // InstallPassword computes the password for a given token.
 func (ps *PlatformSimulator) InstallPassword(token string) string {
-	h := md5.New() //nosec G401 // Required for InSales protocol compatibility
+	h := md5.New() // #nosec G401 -- Required for InSales protocol compatibility
 	h.Write([]byte(token))
 	h.Write([]byte(ps.appSecret))
 	return fmt.Sprintf("%x", h.Sum(nil))
@@ -188,7 +189,7 @@ func (ps *PlatformSimulator) RespondNext(method, path string, resp Response) {
 // Install sends an install callback to the application.
 func (ps *PlatformSimulator) Install(appInstallURL, shop, token string) (int, error) {
 	u := fmt.Sprintf("%s?shop=%s&token=%s&insales_id=42", appInstallURL, shop, token)
-	resp, err := http.Get(u)
+	resp, err := http.Get(u) // #nosec G107 -- тестовый вызов локального URL приложения
 	if err != nil {
 		return 0, fmt.Errorf("install request: %w", err)
 	}
@@ -199,7 +200,7 @@ func (ps *PlatformSimulator) Install(appInstallURL, shop, token string) (int, er
 // Uninstall sends an uninstall callback to the application.
 func (ps *PlatformSimulator) Uninstall(appUninstallURL, shop, password string) (int, error) {
 	u := fmt.Sprintf("%s?shop=%s&token=%s&insales_id=42", appUninstallURL, shop, password)
-	resp, err := http.Get(u)
+	resp, err := http.Get(u) // #nosec G107 -- тестовый вызов локального URL приложения
 	if err != nil {
 		return 0, fmt.Errorf("uninstall request: %w", err)
 	}
@@ -210,7 +211,7 @@ func (ps *PlatformSimulator) Uninstall(appUninstallURL, shop, password string) (
 // Login initiates a login flow by redirecting the browser to the app.
 func (ps *PlatformSimulator) Login(appLoginURL, shop, appID string) (redirectURL string, err error) {
 	u := fmt.Sprintf("%s?shop=%s&insales_id=42&user_id=1", appLoginURL, shop)
-	resp, err := http.Get(u)
+	resp, err := http.Get(u) // #nosec G107 -- тестовый вызов локального URL приложения
 	if err != nil {
 		return "", fmt.Errorf("login request: %w", err)
 	}
@@ -234,11 +235,11 @@ func (ps *PlatformSimulator) CompleteLogin(callbackURL, nonce, password string,
 	fullURL := fmt.Sprintf("%s?token3=%s&user_email=%s&user_name=%s&user_id=%s&email_confirmed=%s",
 		callbackURL, token3, url.QueryEscape(email), url.QueryEscape(name), userID, emailConfirmed)
 
-	return http.Get(fullURL)
+	return http.Get(fullURL) // #nosec G107 -- тестовый вызов локального URL приложения
 }
 
 func (ps *PlatformSimulator) computeToken3(nonce, email, name, userID, emailConfirmed, password string) string {
-	h := md5.New() //nosec G401 // Required for InSales protocol compatibility
+	h := md5.New() // #nosec G401 -- Required for InSales protocol compatibility
 	h.Write([]byte(nonce))
 	h.Write([]byte(email))
 	h.Write([]byte(name))
@@ -320,7 +321,7 @@ func (ps *PlatformSimulator) handleAccount(w http.ResponseWriter, r *http.Reques
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(acc)
+	_ = json.NewEncoder(w).Encode(acc)
 }
 
 // handleLoginRedirect handles the InSales login redirect.
@@ -341,7 +342,7 @@ func (ps *PlatformSimulator) handleLoginRedirect(w http.ResponseWriter, r *http.
 	// The password is stored in the simulator
 	// For now, just acknowledge the redirect
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Login simulated"))
+	_, _ = w.Write([]byte("Login simulated"))
 }
 
 // sendResponse sends a canned response.
@@ -351,7 +352,7 @@ func (ps *PlatformSimulator) sendResponse(w http.ResponseWriter, resp Response) 
 		hj, ok := w.(http.Hijacker)
 		if ok {
 			conn, _, _ := hj.Hijack()
-			conn.Close()
+			_ = conn.Close()
 		}
 		return
 	}
@@ -364,7 +365,7 @@ func (ps *PlatformSimulator) sendResponse(w http.ResponseWriter, resp Response) 
 		w.Header().Set(k, v)
 	}
 	w.WriteHeader(resp.Status)
-	w.Write([]byte(resp.Body))
+	_, _ = w.Write([]byte(resp.Body))
 }
 
 // Request is a helper to make requests to the simulator.

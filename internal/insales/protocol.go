@@ -7,14 +7,14 @@
 package insales
 
 import (
-	"crypto/md5" //nosec G501 // Required for InSales protocol compatibility
+	"crypto/md5" // #nosec G501 -- Required for InSales protocol compatibility
 	"fmt"
 )
 
 // InstallPassword computes the InSales store password.
 // Formula: MD5(token + app_secret) as lowercase hex.
 func InstallPassword(token, appSecret string) string {
-	h := md5.New() //nosec G401 // Required for InSales protocol compatibility
+	h := md5.New() // #nosec G401 -- Required for InSales protocol compatibility
 	h.Write([]byte(token))
 	h.Write([]byte(appSecret))
 	return fmt.Sprintf("%x", h.Sum(nil))
@@ -23,7 +23,7 @@ func InstallPassword(token, appSecret string) string {
 // Token computes the original InSales autologin token.
 // Formula: MD5(nonce + password) as lowercase hex.
 func Token(nonce, password string) string {
-	h := md5.New() //nosec G401 // Required for InSales protocol compatibility
+	h := md5.New() // #nosec G401 -- Required for InSales protocol compatibility
 	h.Write([]byte(nonce))
 	h.Write([]byte(password))
 	return fmt.Sprintf("%x", h.Sum(nil))
@@ -32,7 +32,7 @@ func Token(nonce, password string) string {
 // Token2 computes the second-generation InSales autologin token.
 // Formula: MD5(nonce + user_email + user_name + user_id + password) as lowercase hex.
 func Token2(nonce, userEmail, userName, userID, password string) string {
-	h := md5.New() //nosec G401 // Required for InSales protocol compatibility
+	h := md5.New() // #nosec G401 -- Required for InSales protocol compatibility
 	h.Write([]byte(nonce))
 	h.Write([]byte(userEmail))
 	h.Write([]byte(userName))
@@ -49,7 +49,7 @@ func Token2(nonce, userEmail, userName, userID, password string) string {
 // email_confirmed must be the literal string "true" or "false".
 // user_name can be empty. All fields are UTF-8, concatenated without separators.
 func Token3(nonce, userEmail, userName, userID, emailConfirmed, password string) string {
-	h := md5.New() //nosec G401 // Required for InSales protocol compatibility
+	h := md5.New() // #nosec G401 -- Required for InSales protocol compatibility
 	h.Write([]byte(nonce))
 	h.Write([]byte(userEmail))
 	h.Write([]byte(userName))

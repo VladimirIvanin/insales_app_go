@@ -229,6 +229,7 @@ func getSessionID(r *http.Request) string {
 
 // setSessionCookie sets the session cookie on the response.
 func (a *App) setSessionCookie(w http.ResponseWriter, sessionID string) {
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_id",
 		Value:    sessionID,
@@ -242,6 +243,7 @@ func (a *App) setSessionCookie(w http.ResponseWriter, sessionID string) {
 
 // clearSessionCookie removes the session cookie.
 func (a *App) clearSessionCookie(w http.ResponseWriter) {
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_id",
 		Value:    "",
@@ -255,6 +257,7 @@ func (a *App) clearSessionCookie(w http.ResponseWriter) {
 
 // setChallengeCookie sets the challenge cookie for login binding.
 func (a *App) setChallengeCookie(w http.ResponseWriter, challengeID string) {
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
 	http.SetCookie(w, &http.Cookie{
 		Name:     "challenge_id",
 		Value:    challengeID,
@@ -277,6 +280,7 @@ func getChallengeID(r *http.Request) string {
 
 // clearChallengeCookie removes the challenge cookie.
 func (a *App) clearChallengeCookie(w http.ResponseWriter) {
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
 	http.SetCookie(w, &http.Cookie{
 		Name:     "challenge_id",
 		Value:    "",
@@ -301,6 +305,7 @@ func (a *App) getOrCreateBrowserID(r *http.Request, w http.ResponseWriter) strin
 	}
 	browserID := hex.EncodeToString(b)
 
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
 	http.SetCookie(w, &http.Cookie{
 		Name:     "browser_id",
 		Value:    browserID,
@@ -381,7 +386,9 @@ func (a *App) handleInstall(w http.ResponseWriter, r *http.Request) {
 	slog.Info("install callback processed", "shop", shop, "insales_id", insalesID, "candidate", result.CandidateID)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	a.tmpls.ExecuteTemplate(w, "install_ok.html", nil)
+	if err := a.tmpls.ExecuteTemplate(w, "install_ok.html", nil); err != nil {
+		slog.Error("render install page", "error", err)
+	}
 }
 
 // handleLogin processes GET /login?shop=...&insales_id=...&user_id=...
@@ -435,8 +442,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("login initiated", "shop", shop, "challenge", result.ChallengeID, "nonce", nonce[:8]+"...")
 
-	// Redirect to InSales
-	http.Redirect(w, r, redirectURL, http.StatusFound)
+	http.Redirect(w, r, redirectURL, http.StatusFound) // #nosec G710 -- host совпадает с shop установленного магазина
 }
 
 // handleAuthCallback processes GET /auth/callback after InSales login redirect.
@@ -537,7 +543,9 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	a.tmpls.ExecuteTemplate(w, "dashboard.html", data)
+	if err := a.tmpls.ExecuteTemplate(w, "dashboard.html", data); err != nil {
+		slog.Error("render dashboard", "error", err)
+	}
 }
 
 // handleProbe processes POST /probe — makes an API call to verify connectivity.
@@ -572,7 +580,9 @@ func (a *App) handleProbe(w http.ResponseWriter, r *http.Request) {
 			ProbeError:  true,
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		a.tmpls.ExecuteTemplate(w, "dashboard.html", data)
+		if err := a.tmpls.ExecuteTemplate(w, "dashboard.html", data); err != nil {
+			slog.Error("render dashboard", "error", err)
+		}
 		return
 	}
 
@@ -585,7 +595,9 @@ func (a *App) handleProbe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	a.tmpls.ExecuteTemplate(w, "dashboard.html", data)
+	if err := a.tmpls.ExecuteTemplate(w, "dashboard.html", data); err != nil {
+		slog.Error("render dashboard", "error", err)
+	}
 }
 
 // handleLogout processes POST /logout — terminates a session.
@@ -597,7 +609,9 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 	sessionID := getSessionID(r)
 	if sessionID != "" {
-		a.lifecycle.Logout(sessionID)
+		if err := a.lifecycle.Logout(sessionID); err != nil {
+			slog.Error("logout failed", "error", err)
+		}
 	}
 
 	a.clearSessionCookie(w)
@@ -651,7 +665,9 @@ func (a *App) handleUninstall(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("uninstall: wrong password", "shop", shop)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte("Forbidden"))
+		if _, err := w.Write([]byte("Forbidden")); err != nil {
+			slog.Debug("write uninstall response", "error", err)
+		}
 		return
 	}
 
@@ -659,18 +675,24 @@ func (a *App) handleUninstall(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		slog.Debug("write uninstall response", "error", err)
+	}
 }
 
 // handleHealthz processes GET /healthz.
 func (a *App) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		slog.Debug("write health response", "error", err)
+	}
 }
 
 // writeError renders the error template with the given message and status code.
 func writeError(w http.ResponseWriter, tmpls *template.Template, message string, status int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	tmpls.ExecuteTemplate(w, "error.html", ErrorData{Message: message})
+	if err := tmpls.ExecuteTemplate(w, "error.html", ErrorData{Message: message}); err != nil {
+		slog.Error("render error page", "error", err)
+	}
 }
