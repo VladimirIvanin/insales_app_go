@@ -34,6 +34,31 @@ func TestDBStatusAndUpgrade(t *testing.T) {
 	}
 }
 
+func TestEnsureDBDirAcceptsFileInRoot(t *testing.T) {
+	const path = "/insales-app-go-root-db-test.sqlite3"
+	if err := ensureDBDir(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("root database file appeared, stat err=%v", err)
+	}
+}
+
+func TestEnsureDBDirCreatesParent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nested", "app.sqlite3")
+	if err := ensureDBDir(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("parent is not a directory")
+	}
+}
+
 func TestUnknownCommand(t *testing.T) {
 	if code := run([]string{"nope"}); code == 0 {
 		t.Fatal("unknown command succeeded")

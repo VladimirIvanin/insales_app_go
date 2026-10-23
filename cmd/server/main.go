@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -276,11 +277,12 @@ func openStore(cfg *config.Config) (*storage.DB, error) {
 }
 
 func ensureDBDir(dbPath string) error {
-	if idx := strings.LastIndex(dbPath, "/"); idx >= 0 {
-		dir := dbPath[:idx]
-		if err := os.MkdirAll(dir, 0750); err != nil {
-			return fmt.Errorf("cannot create db directory: %w", err)
-		}
+	dir := filepath.Dir(dbPath)
+	if dir == "." {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return fmt.Errorf("cannot create db directory: %w", err)
 	}
 	return nil
 }

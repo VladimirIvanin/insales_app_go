@@ -42,6 +42,18 @@ ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 	}
 }
 
+func TestLoadRejectsEmptyEncryptionKey(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("INSALES_APP_ID", "app")
+	t.Setenv("INSALES_APP_SECRET", "secret")
+	t.Setenv("APP_BASE_URL", "https://app.example.test")
+	t.Setenv("ALLOWED_SHOPS", "shop.example.test")
+	t.Setenv("ENCRYPTION_KEY", "")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("empty encryption key was accepted")
+	}
+}
+
 func TestLoadRejectsEmptyAllowlist(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("INSALES_APP_ID", "app")

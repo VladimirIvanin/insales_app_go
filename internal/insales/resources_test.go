@@ -19,12 +19,12 @@ func TestOrdersAndProductsAgainstSimulator(t *testing.T) {
 	defer sim.Close()
 
 	sim.Define(http.MethodGet, "/admin/orders.json", testutil.Response{
-		Status: 200, Body: `[{"id":5,"number":100,"status":"new"}]`,
+		Status: 200, Body: `[{"id":5,"number":100,"fulfillment_status":"new","financial_status":"pending"}]`,
 		Headers: map[string]string{"API-Usage-Limit": "2/500"},
 	})
 	sim.Define(http.MethodGet, "/admin/orders/5.json", testutil.Response{Status: 200, Body: `{"id":5,"number":100}`})
 	sim.Define(http.MethodGet, "/admin/orders/count.json", testutil.Response{Status: 200, Body: `{"count":3}`})
-	sim.Define(http.MethodPut, "/admin/orders/5.json", testutil.Response{Status: 200, Body: `{"id":5,"number":100,"status":"cancelled"}`})
+	sim.Define(http.MethodPut, "/admin/orders/5.json", testutil.Response{Status: 200, Body: `{"id":5,"number":100,"fulfillment_status":"declined"}`})
 	sim.Define(http.MethodGet, "/admin/products.json", testutil.Response{Status: 200, Body: `[{"id":9,"title":"Mug"}]`})
 	sim.Define(http.MethodGet, "/admin/products/9.json", testutil.Response{Status: 200, Body: `{"id":9,"title":"Mug"}`})
 	sim.Define(http.MethodGet, "/admin/products/count.json", testutil.Response{Status: 200, Body: `{"count":1}`})
@@ -48,8 +48,8 @@ func TestOrdersAndProductsAgainstSimulator(t *testing.T) {
 	if err != nil || count != 3 {
 		t.Fatalf("count %d %v", count, err)
 	}
-	updated, err := client.UpdateOrder(ctx, 5, map[string]any{"status": "cancelled"})
-	if err != nil || updated.Status != "cancelled" {
+	updated, err := client.UpdateOrder(ctx, 5, map[string]any{"fulfillment_status": "declined"})
+	if err != nil || updated.FulfillmentStatus != "declined" {
 		t.Fatalf("update %+v %v", updated, err)
 	}
 
@@ -85,10 +85,10 @@ func TestUpdateOrderSendsJSON(t *testing.T) {
 		r.ContentLength = int64(len(body))
 		return http.DefaultTransport.RoundTrip(r)
 	})})
-	if _, err := client.UpdateOrder(context.Background(), 5, map[string]any{"status": "cancelled"}); err != nil {
+	if _, err := client.UpdateOrder(context.Background(), 5, map[string]any{"fulfillment_status": "declined"}); err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != `{"order":{"status":"cancelled"}}` {
+	if string(body) != `{"order":{"fulfillment_status":"declined"}}` {
 		t.Fatalf("body %s", body)
 	}
 }

@@ -11,9 +11,11 @@ import (
 
 // Order is a compact InSales order.
 type Order struct {
-	ID     int    `json:"id"`
-	Number int    `json:"number"`
-	Status string `json:"status,omitempty"`
+	ID                int    `json:"id"`
+	Number            int    `json:"number"`
+	FulfillmentStatus string `json:"fulfillment_status,omitempty"`
+	FinancialStatus   string `json:"financial_status,omitempty"`
+	CustomStatus      string `json:"custom_status,omitempty"`
 }
 
 // ListOrders returns GET /admin/orders.json.

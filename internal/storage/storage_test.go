@@ -3,6 +3,7 @@ package storage_test
 import (
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -87,11 +88,27 @@ func TestInstallLimitDedupAndTTL(t *testing.T) {
 		t.Fatalf("dedup changed identity: %+v vs %+v", again, first)
 	}
 
+	accepted := 0
 	for i := 0; i < 6; i++ {
 		id := "extra-" + string(rune('a'+i))
-		if _, err := db.SaveInstall(id, 100+i, "shop.example.test", "pw-"+id); err != nil {
+		_, err := db.SaveInstall(id, 100+i, "shop.example.test", "pw-"+id)
+		if errors.Is(err, storage.ErrCapacity) {
+			continue
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
+		accepted++
+	}
+	if accepted != storage.MaxCandidatesPerShop-1 {
+		t.Fatalf("accepted extras = %d, want %d", accepted, storage.MaxCandidatesPerShop-1)
+	}
+	kept, err := db.SaveInstall("again", 1, "shop.example.test", "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.Created || kept.CandidateID != first.CandidateID {
+		t.Fatalf("full queue dropped the first credential: %+v", kept)
 	}
 	n, err := db.CountCandidates("shop.example.test")
 	if err != nil {
@@ -144,7 +161,7 @@ func TestActiveCredentialDoesNotResetSession(t *testing.T) {
 	}
 }
 
-func TestUninstallKeepsOtherPending(t *testing.T) {
+func TestLateUninstallKeepsDifferentPending(t *testing.T) {
 	db := newTestDB(t)
 	active, err := db.SaveInstall("active", 1, "shop.example.test", "active-pw")
 	if err != nil {
@@ -153,10 +170,21 @@ func TestUninstallKeepsOtherPending(t *testing.T) {
 	if ok, err := db.ActivateCandidate(active.CandidateID, "Shop"); err != nil || !ok {
 		t.Fatalf("activate %v %v", ok, err)
 	}
+	if err := db.CreateSession("sess", 1, "user", active.Generation, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateChallenge("ch", "nonce", "browser", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	same, err := db.SaveInstall("same", 1, "shop.example.test", "active-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
 	other, err := db.SaveInstall("other", 1, "shop.example.test", "other-pw")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	removed, err := db.Uninstall(1, "shop.example.test", "active-pw")
 	if err != nil || !removed {
 		t.Fatalf("uninstall %v %v", removed, err)
@@ -164,9 +192,32 @@ func TestUninstallKeepsOtherPending(t *testing.T) {
 	if _, err := db.GetActiveStore(1); err != storage.ErrNotFound {
 		t.Fatalf("active still present: %v", err)
 	}
+	var sessions, challenges int
+	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM challenges`).Scan(&challenges); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 || challenges != 0 {
+		t.Fatalf("sessions=%d challenges=%d", sessions, challenges)
+	}
+	if ok, err := db.ActivateCandidate(same.CandidateID, "Same"); err != nil || ok {
+		t.Fatalf("same-password pending survived: activated=%v err=%v", ok, err)
+	}
 	pending, err := db.NewestPending(1, "shop.example.test")
-	if err != nil || pending == nil || pending.ID != other.CandidateID {
-		t.Fatalf("other pending = %+v err %v", pending, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending == nil || pending.ID != other.CandidateID || pending.Password != "other-pw" {
+		t.Fatalf("other pending = %+v", pending)
+	}
+	if ok, err := db.ActivateCandidate(other.CandidateID, "Other"); err != nil || !ok {
+		t.Fatalf("activate other %v %v", ok, err)
+	}
+	store, err := db.GetActiveStore(1)
+	if err != nil || store.Password != "other-pw" {
+		t.Fatalf("store = %+v err %v", store, err)
 	}
 }
 
@@ -210,6 +261,10 @@ func TestPendingUninstallDoesNotRemoveActive(t *testing.T) {
 	if _, err := db.SaveInstall("p", 1, "shop.example.test", "pending-pw"); err != nil {
 		t.Fatal(err)
 	}
+	keep, err := db.SaveInstall("keep", 1, "shop.example.test", "keep-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
 	removed, err := db.Uninstall(1, "shop.example.test", "pending-pw")
 	if err != nil || !removed {
 		t.Fatalf("removed=%v err=%v", removed, err)
@@ -217,6 +272,13 @@ func TestPendingUninstallDoesNotRemoveActive(t *testing.T) {
 	store, err := db.GetActiveStore(1)
 	if err != nil || store.Password != "active-pw" {
 		t.Fatalf("store = %+v err %v", store, err)
+	}
+	pending, err := db.NewestPending(1, "shop.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending == nil || pending.ID != keep.CandidateID || pending.Password != "keep-pw" {
+		t.Fatalf("other pending = %+v", pending)
 	}
 }
 

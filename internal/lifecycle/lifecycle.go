@@ -26,6 +26,7 @@ var (
 	ErrInvalidSignature  = errors.New("invalid signature")
 	ErrTemporary         = errors.New("temporary verification error")
 	ErrVerification      = errors.New("verification response invalid")
+	ErrCapacity          = errors.New("too many pending installs")
 )
 
 // Service handles install, login and uninstall without a background worker.
@@ -82,6 +83,9 @@ type InstallResult struct {
 func (s *Service) HandleInstall(_ context.Context, params InstallParams) (*InstallResult, error) {
 	password := insales.InstallPassword(params.Token, s.appSecret)
 	saved, err := s.store.SaveInstall(randomHex(16), params.InsalesID, params.Shop, password)
+	if errors.Is(err, storage.ErrCapacity) {
+		return nil, ErrCapacity
+	}
 	if err != nil {
 		return nil, fmt.Errorf("save install: %w", err)
 	}
@@ -103,16 +107,6 @@ type UninstallParams struct {
 // HandleUninstall checks the credential and cancels the matching connection.
 func (s *Service) HandleUninstall(_ context.Context, params UninstallParams) error {
 	storeID := params.InsalesID
-	if storeID <= 0 {
-		store, err := s.store.GetStoreByShop(params.Shop)
-		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				return ErrStoreNotInstalled
-			}
-			return err
-		}
-		storeID = store.ID
-	}
 	removed, err := s.store.Uninstall(storeID, params.Shop, params.Token)
 	if errors.Is(err, storage.ErrNotAuthorized) {
 		return ErrForbidden

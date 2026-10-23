@@ -9,9 +9,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"html"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -78,7 +78,7 @@ func New(cfg *config.Config, lc *lifecycle.Service, storeDB *storage.DB) (*App, 
 	mux.HandleFunc("/", app.handleDashboard)
 
 	app.server = &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.BindHost, cfg.Port),
+		Addr:         net.JoinHostPort(cfg.BindHost, strconv.Itoa(cfg.Port)),
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -116,7 +116,7 @@ func getSessionID(r *http.Request) string {
 
 // setSessionCookie sets the session cookie on the response.
 func (a *App) setSessionCookie(w http.ResponseWriter, sessionID string) {
-	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_id",
 		Value:    sessionID,
@@ -130,7 +130,7 @@ func (a *App) setSessionCookie(w http.ResponseWriter, sessionID string) {
 
 // clearSessionCookie removes the session cookie.
 func (a *App) clearSessionCookie(w http.ResponseWriter) {
-	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_id",
 		Value:    "",
@@ -144,7 +144,7 @@ func (a *App) clearSessionCookie(w http.ResponseWriter) {
 
 // setChallengeCookie sets the challenge cookie for login binding.
 func (a *App) setChallengeCookie(w http.ResponseWriter, challengeID string) {
-	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL
 	http.SetCookie(w, &http.Cookie{
 		Name:     "challenge_id",
 		Value:    challengeID,
@@ -167,7 +167,7 @@ func getChallengeID(r *http.Request) string {
 
 // clearChallengeCookie removes the challenge cookie.
 func (a *App) clearChallengeCookie(w http.ResponseWriter) {
-	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL
 	http.SetCookie(w, &http.Cookie{
 		Name:     "challenge_id",
 		Value:    "",
@@ -192,7 +192,7 @@ func (a *App) getOrCreateBrowserID(r *http.Request, w http.ResponseWriter) strin
 	}
 	browserID := hex.EncodeToString(b)
 
-	// #nosec G124 -- Secure повторяет схему APP_BASE_URL: для loopback HTTP cookie без Secure
+	// #nosec G124 -- Secure повторяет схему APP_BASE_URL
 	http.SetCookie(w, &http.Cookie{
 		Name:     "browser_id",
 		Value:    browserID,
@@ -257,6 +257,11 @@ func (a *App) handleInstall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := a.lifecycle.HandleInstall(r.Context(), params)
+	if errors.Is(err, lifecycle.ErrCapacity) {
+		slog.Warn("install rejected: pending limit", "shop", shop)
+		writeError(w, a.tmpls, "Слишком много непроверенных установок для этого магазина", http.StatusServiceUnavailable)
+		return
+	}
 	if err != nil {
 		slog.Error("install failed", "shop", shop, "error", err)
 		writeError(w, a.tmpls, "Ошибка установки", http.StatusInternalServerError)
@@ -476,7 +481,7 @@ func (a *App) handleProbe(w http.ResponseWriter, r *http.Request) {
 			Shop:        store.Shop,
 			StoreID:     store.ID,
 			UserID:      sess.UserID,
-			ProbeResult: fmt.Sprintf("Ошибка API: %s", html.EscapeString(err.Error())),
+			ProbeResult: fmt.Sprintf("Ошибка API: %s", err.Error()),
 			ProbeError:  true,
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -491,7 +496,7 @@ func (a *App) handleProbe(w http.ResponseWriter, r *http.Request) {
 		Shop:        store.Shop,
 		StoreID:     store.ID,
 		UserID:      sess.UserID,
-		ProbeResult: fmt.Sprintf("API доступен. Магазин: %s (ID: %d)", html.EscapeString(account.Title), account.ID),
+		ProbeResult: fmt.Sprintf("API доступен. Магазин: %s (ID: %d)", account.Title, account.ID),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -529,13 +534,13 @@ func (a *App) handleUninstall(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	insalesIDStr := r.URL.Query().Get("insales_id")
 
-	if shop == "" || token == "" {
-		writeError(w, a.tmpls, "Неверные параметры удаления", http.StatusBadRequest)
+	if shop == "" || token == "" || insalesIDStr == "" {
+		writeError(w, a.tmpls, "Неверные параметры удаления: shop, token и insales_id обязательны", http.StatusBadRequest)
 		return
 	}
 
 	// Check for duplicate query parameters
-	if len(r.URL.Query()["shop"]) != 1 || len(r.URL.Query()["token"]) != 1 {
+	if len(r.URL.Query()["shop"]) != 1 || len(r.URL.Query()["token"]) != 1 || len(r.URL.Query()["insales_id"]) != 1 {
 		writeError(w, a.tmpls, "Повторяющиеся параметры запроса", http.StatusBadRequest)
 		return
 	}

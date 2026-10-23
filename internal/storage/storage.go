@@ -20,7 +20,9 @@ import (
 )
 
 const (
-	// MaxCandidatesPerShop — сколько непроверенных установок хранить на один домен.
+	// MaxCandidatesPerShop — сколько непроверенных установок одного домена
+	// хранить одновременно. Новый пароль сверх лимита отклоняется и не удаляет
+	// уже принятые записи. Место освобождает CandidateTTL.
 	MaxCandidatesPerShop = 5
 	// CandidateTTL — срок жизни непроверенного кандидата.
 	CandidateTTL = 7 * 24 * time.Hour
@@ -32,6 +34,7 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrNotAuthorized = errors.New("not authorized")
 	ErrStale         = errors.New("stale generation")
+	ErrCapacity      = errors.New("too many pending installs")
 )
 
 // Migration describes one schema version.
@@ -524,9 +527,6 @@ func (s *DB) SaveInstall(candidateID string, storeID int, shop, password string)
 		return InstallSave{}, err
 	}
 	if active != nil && active.Shop == shop && passwordsEqual(password, []byte(active.Password)) {
-		if err := s.trimCandidates(tx, shop, MaxCandidatesPerShop, ""); err != nil {
-			return InstallSave{}, err
-		}
 		if err := tx.Commit(); err != nil {
 			return InstallSave{}, err
 		}
@@ -554,17 +554,14 @@ func (s *DB) SaveInstall(candidateID string, storeID int, shop, password string)
 				}
 			}
 		}
-		if err := s.trimCandidates(tx, shop, MaxCandidatesPerShop, keeper.ID); err != nil {
-			return InstallSave{}, err
-		}
 		if err := tx.Commit(); err != nil {
 			return InstallSave{}, err
 		}
 		return InstallSave{CandidateID: keeper.ID, Generation: keeper.Generation, Created: false}, nil
 	}
 
-	if err := s.trimCandidates(tx, shop, MaxCandidatesPerShop-1, ""); err != nil {
-		return InstallSave{}, err
+	if len(rows) >= MaxCandidatesPerShop {
+		return InstallSave{}, ErrCapacity
 	}
 	gen, err := s.reserveGeneration(tx)
 	if err != nil {
@@ -611,59 +608,6 @@ func (s *DB) deleteExpiredCandidates(tx *sql.Tx, shop string) error {
 		if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (s *DB) trimCandidates(tx *sql.Tx, shop string, keep int, protectID string) error {
-	if keep < 0 {
-		keep = 0
-	}
-	rows, err := tx.Query(`
-		SELECT id FROM candidates
-		WHERE shop = ?
-		ORDER BY created_at ASC, generation ASC, id ASC
-	`, shop)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	excess := len(ids) - keep
-	if protectID != "" {
-		// Защищённая запись не считается лишней.
-		removable := 0
-		for _, id := range ids {
-			if id != protectID {
-				removable++
-			}
-		}
-		if removable+1 <= keep {
-			excess = 0
-		}
-	}
-	removed := 0
-	for _, id := range ids {
-		if removed >= excess {
-			break
-		}
-		if id == protectID {
-			continue
-		}
-		if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
-			return err
-		}
-		removed++
 	}
 	return nil
 }
@@ -937,6 +881,8 @@ func (s *DB) ListStores() ([]Store, error) {
 }
 
 // Uninstall removes the connection that matches insales id, shop and credential.
+// Pending rows are removed only when the password matches, so a later install
+// with another password survives a delayed uninstall of the previous one.
 // removed is false when nothing matched. ErrNotAuthorized means the pair exists
 // but the password does not.
 func (s *DB) Uninstall(storeID int, shop, password string) (bool, error) {
@@ -981,12 +927,18 @@ func (s *DB) Uninstall(storeID int, shop, password string) (bool, error) {
 	}
 	rows.Close()
 
-	if activeMatch {
-		for _, id := range matched {
-			if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
-				return false, err
-			}
+	if !activeMatch && len(matched) == 0 {
+		if activeHere || hadPending {
+			return false, ErrNotAuthorized
 		}
+		return false, nil
+	}
+	for _, id := range matched {
+		if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
+			return false, err
+		}
+	}
+	if activeMatch {
 		if _, err := tx.Exec(`DELETE FROM sessions WHERE store_id = ?`, storeID); err != nil {
 			return false, err
 		}
@@ -996,20 +948,8 @@ func (s *DB) Uninstall(storeID int, shop, password string) (bool, error) {
 		if _, err := tx.Exec(`DELETE FROM stores WHERE id = ?`, storeID); err != nil {
 			return false, err
 		}
-		return true, tx.Commit()
 	}
-	if len(matched) > 0 {
-		for _, id := range matched {
-			if _, err := tx.Exec(`DELETE FROM candidates WHERE id = ?`, id); err != nil {
-				return false, err
-			}
-		}
-		return true, tx.Commit()
-	}
-	if activeHere || hadPending {
-		return false, ErrNotAuthorized
-	}
-	return false, nil
+	return true, tx.Commit()
 }
 
 func (s *DB) cleanupExpired(tx *sql.Tx) error {

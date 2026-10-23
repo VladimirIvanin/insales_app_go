@@ -782,9 +782,12 @@ func TestUninstallMissingParams(t *testing.T) {
 		url  string
 	}{
 		{"no params", "/uninstall"},
-		{"missing shop", "/uninstall?token=abc"},
-		{"missing token", "/uninstall?shop=test.shop"},
-		{"duplicate shop", "/uninstall?shop=a&shop=b&token=abc"},
+		{"missing shop", "/uninstall?token=abc&insales_id=1"},
+		{"missing token", "/uninstall?shop=test.shop&insales_id=1"},
+		{"missing insales_id", "/uninstall?shop=test.shop&token=abc"},
+		{"duplicate shop", "/uninstall?shop=a&shop=b&token=abc&insales_id=1"},
+		{"duplicate token", "/uninstall?shop=a&token=abc&token=def&insales_id=1"},
+		{"duplicate insales_id", "/uninstall?shop=a&token=abc&insales_id=1&insales_id=2"},
 	}
 
 	for _, tt := range tests {
@@ -801,6 +804,89 @@ func TestUninstallMissingParams(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestForgedInstallDoesNotEvictAcceptedCandidate(t *testing.T) {
+	fx, srv := newFixture(t)
+	shop := sharedTestShop(1)
+	realToken := "real-install-token"
+	realPassword := insales.InstallPassword(realToken, "test-app-secret")
+
+	status, body := getStatus(t, fmt.Sprintf("%s/install?shop=%s&token=%s&insales_id=7",
+		srv.URL, url.QueryEscape(shop), url.QueryEscape(realToken)))
+	if status != http.StatusOK {
+		t.Fatalf("real install status = %d, body = %s", status, body)
+	}
+
+	rejected := 0
+	for i := 0; i < 5; i++ {
+		status, body = getStatus(t, fmt.Sprintf("%s/install?shop=%s&token=%s&insales_id=%d",
+			srv.URL, url.QueryEscape(shop), url.QueryEscape(fmt.Sprintf("forged-%d", i)), 1000+i))
+		switch status {
+		case http.StatusOK:
+		case http.StatusServiceUnavailable:
+			rejected++
+			if !strings.Contains(body, "Слишком много непроверенных установок") {
+				t.Fatalf("overflow body = %s", body)
+			}
+		default:
+			t.Fatalf("forged install %d status = %d, body = %s", i, status, body)
+		}
+	}
+	if rejected != 1 {
+		t.Fatalf("rejected forged installs = %d, want 1", rejected)
+	}
+
+	pending, err := fx.DB.NewestPending(7, shop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending == nil || pending.Password != realPassword {
+		t.Fatalf("real pending = %+v", pending)
+	}
+	n, err := fx.DB.CountCandidates(shop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != storage.MaxCandidatesPerShop {
+		t.Fatalf("candidates = %d, want %d", n, storage.MaxCandidatesPerShop)
+	}
+}
+
+func TestUninstallDuplicateInsalesIDKeepsStore(t *testing.T) {
+	fx, srv := newFixture(t)
+	shop := sharedTestShop(42)
+	installStore(t, fx, srv, shop, 42)
+	store, err := fx.DB.GetActiveStore(42)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status, body := getStatus(t, fmt.Sprintf("%s/uninstall?shop=%s&token=%s&insales_id=42&insales_id=99",
+		srv.URL, url.QueryEscape(shop), url.QueryEscape(store.Password)))
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", status, body)
+	}
+	if !strings.Contains(body, "Повторяющиеся параметры") {
+		t.Fatalf("body = %s", body)
+	}
+	if _, err := fx.DB.GetActiveStore(42); err != nil {
+		t.Fatalf("store removed: %v", err)
+	}
+}
+
+func getStatus(t *testing.T, rawURL string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(rawURL) //nolint:noctx
+	if err != nil {
+		t.Fatalf("GET %s: %v", rawURL, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, string(body)
 }
 
 // TestUninstallTwice tests that uninstalling an already-uninstalled store
